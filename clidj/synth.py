@@ -156,13 +156,13 @@ def techno_loop_track(
     return (out / peak * 0.8).astype(np.float32)
 
 
-def write_audio(path: Path, audio: np.ndarray, sr: int) -> Path:
+def write_audio(path: Path, audio: np.ndarray, sr: int, bit_depth: int = 16) -> Path:
     """Write (frames, channels) float32 audio; format from the extension."""
     from pedalboard.io import AudioFile
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     data = np.ascontiguousarray(np.asarray(audio, dtype=np.float32).T)
-    with AudioFile(str(path), "w", samplerate=sr, num_channels=data.shape[0]) as f:
+    with AudioFile(str(path), "w", samplerate=sr, num_channels=data.shape[0], bit_depth=bit_depth) as f:
         f.write(data)
     return path

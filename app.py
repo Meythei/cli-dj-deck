@@ -1,5 +1,7 @@
-"""Compatibility launcher: `python app.py` still works; the app lives in clidj.ui.app."""
-from clidj.ui.app import main
+"""Compatibility launcher: `python app.py` still works; see clidj.cli."""
+import sys
+
+from clidj.cli import main
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

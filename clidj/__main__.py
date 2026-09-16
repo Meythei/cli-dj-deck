@@ -1,5 +1,7 @@
 """`python -m clidj` entry point."""
-from clidj.ui.app import main
+import sys
+
+from clidj.cli import main
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
