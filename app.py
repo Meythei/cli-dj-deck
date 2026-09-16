@@ -11,18 +11,22 @@ BPM -- is a visual simulation.
 from __future__ import annotations
 
 import argparse
+import math
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.css.query import NoMatches
 from textual.widgets import DataTable, Input, RichLog, Static, TabbedContent, TabPane
 
 from interpreter import Interpreter
 from lanes import LANE_NAMES, Lane, check_warnings
-from library import DEMO_LIBRARY, Track
+from library import DEMO_LIBRARY, SAMPLES_PER_BEAT, Track
 from scheduler import Scheduler
 from snippets import BEATS_PER_BAR as SNIPPET_BEATS_PER_BAR
 from snippets import Snippet
@@ -32,6 +36,7 @@ BAR_CHARS = " ▁▂▃▄▅▆▇█"  # " ▁▂▃▄▅▆▇█"
 QUARTER_COLS_PER_BEAT = 4  # 1 character column ~= 1/4 beat in the zoomed lane view
 LANE_ACCENTS = {"L1": "cyan", "L2": "magenta", "L3": "yellow", "L4": "green"}
 MIN_WIDTH = 20
+LANE_GUTTER = 4  # columns left of the waveform area: lane name on info rows, blank on the rest
 SETS_DIR = Path(__file__).parent / "sets"
 
 
@@ -93,10 +98,73 @@ def _loop_display(lane: Lane, transport: Transport) -> str:
     return f"{remaining_bars:.1f} left"
 
 
+@dataclass(frozen=True)
+class WaveAxis:
+    """The one column <-> beat mapping shared by the ruler and every lane's
+    waveform rows, so the ▼ marker, bar lines and waveform columns can't
+    drift apart.
+
+    Columns [left, left + width) are the waveform area; the playhead sits at
+    `center`. Column `c` covers beats [beat(c) - 1/8, beat(c) + 1/8) around
+    `beat(c) = position + (c - center) / QUARTER_COLS_PER_BEAT`, and a beat
+    `b` is drawn in the column whose range contains it.
+    """
+
+    left: int
+    width: int
+
+    @property
+    def center(self) -> int:
+        return self.left + self.width // 2
+
+    def columns(self) -> range:
+        return range(self.left, self.left + self.width)
+
+    def offset_beats(self, col: int) -> float:
+        return (col - self.center) / QUARTER_COLS_PER_BEAT
+
+    def col_for_offset(self, offset_beats: float) -> int:
+        return self.center + math.floor(offset_beats * QUARTER_COLS_PER_BEAT + 0.5)
+
+    @classmethod
+    def for_width(cls, width: int) -> "WaveAxis":
+        return cls(left=LANE_GUTTER, width=max(4, width - LANE_GUTTER))
+
+
+def _bar_head_columns(axis: WaveAxis, position: float, beats_per_bar: int) -> dict[int, str]:
+    """col -> "bar" | "beat" for every beat head visible on the axis."""
+    lo = math.floor(position + axis.offset_beats(axis.left)) - 1
+    hi = math.ceil(position + axis.offset_beats(axis.left + axis.width)) + 1
+    heads: dict[int, str] = {}
+    for beat_n in range(lo, hi + 1):
+        col = axis.col_for_offset(beat_n - position)
+        if axis.left <= col < axis.left + axis.width:
+            heads[col] = "bar" if beat_n % beats_per_bar == 0 else "beat"
+    return heads
+
+
+def _column_amplitude(snippet: Snippet, local_lo: float, local_hi: float) -> Optional[float]:
+    """Peak waveform amplitude over [local_lo, local_hi) beats of the
+    snippet, or None where a non-looping snippet has nothing to show."""
+    length = snippet.length_beats
+    first = math.floor(local_lo * SAMPLES_PER_BEAT)
+    last = max(first + 1, math.floor(local_hi * SAMPLES_PER_BEAT))
+    peak: Optional[float] = None
+    for index in range(first, last):
+        local = index / SAMPLES_PER_BEAT
+        if snippet.loop:
+            local %= length
+        elif not 0.0 <= local < length:
+            continue
+        amp = snippet.track.amplitude_at_beat(snippet.start_beat + local)
+        peak = amp if peak is None else max(peak, amp)
+    return peak
+
+
 class LanesView(Static):
-    """Transport status, a shared beat ruler, and one zoomed, center-locked
-    waveform row per lane -- all sharing the same beat axis so beat heads
-    line up vertically across lanes."""
+    """Transport status, a shared beat ruler, and per lane an info row plus
+    a two-row zoomed, center-locked waveform -- all drawn on one WaveAxis so
+    beat heads line up vertically across the ruler and every lane."""
 
     def __init__(self, transport: Transport, lanes: dict[str, Lane], quant_getter, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -105,88 +173,81 @@ class LanesView(Static):
         self._quant_getter = quant_getter
 
     def refresh_view(self) -> None:
-        width = max(self.content_size.width, MIN_WIDTH)
+        self.update(self.build_text(max(self.content_size.width, MIN_WIDTH)))
+
+    def build_text(self, width: int) -> Text:
         transport = self.transport
+        axis = WaveAxis.for_width(width)
+        heads = _bar_head_columns(axis, transport.position_beats, transport.beats_per_bar)
 
         status = "● RUN" if transport.running else "■ STOP"
         header = (
             f"TRANSPORT  {transport.display}  {status}  {transport.bpm:.1f} BPM  "
             f"{transport.beats_per_bar}/4  q:{self._quant_getter()}"
         )
-
-        text = Text(header + "\n", style="bold")
-        text.append(self._ruler(width) + "\n", style="grey62")
+        rows: list[Text] = [Text(header, style="bold"), self._ruler(axis, heads)]
         for name in LANE_NAMES:
-            self._append_lane_row(text, self.lanes[name], width)
-        self.update(text)
+            rows.extend(self._lane_rows(self.lanes[name], axis, heads, width))
+        return Text("\n").join(rows)
 
-    def _ruler(self, width: int) -> str:
-        transport = self.transport
-        row = [" "] * width
-        center = width / 2.0
-        base = transport.position_beats
-        beat_lo = int(base - center / QUARTER_COLS_PER_BEAT) - 1
-        beat_hi = int(base + (width - center) / QUARTER_COLS_PER_BEAT) + 1
-        for beat_n in range(beat_lo, beat_hi + 1):
-            col = round(center + (beat_n - base) * QUARTER_COLS_PER_BEAT)
-            if 0 <= col < width:
-                row[col] = "|" if beat_n % transport.beats_per_bar == 0 else "·"
-        playhead_col = round(center)
-        if 0 <= playhead_col < width:
-            row[playhead_col] = "▼"
-        return "".join(row)
+    def _ruler(self, axis: WaveAxis, heads: dict[int, str]) -> Text:
+        row = [" "] * (axis.left + axis.width)
+        for col, kind in heads.items():
+            row[col] = "|" if kind == "bar" else "·"
+        row[axis.center] = "▼"
+        return Text("".join(row), style="grey62")
 
-    def _append_lane_row(self, text: Text, lane: Lane, width: int) -> None:
+    def _lane_rows(self, lane: Lane, axis: WaveAxis, heads: dict[int, str], width: int) -> list[Text]:
         accent = LANE_ACCENTS.get(lane.name, "white")
         warnings: list[str] = []
         if lane.snippet is not None:
             others = [other for name, other in self.lanes.items() if name != lane.name]
             warnings = check_warnings(lane, others, self.transport.bpm)
-        name_style = "bold yellow" if warnings else f"bold {accent}"
 
         if lane.snippet is None:
             label, role, key = "—", "", ""
         else:
             label, role, key = lane.snippet.name, lane.snippet.role, lane.snippet.key
 
-        prefix = f"{lane.name} "
-        info = f"{label:<9.9}{role:<7.7}{key:<4.4}"
-        suffix = f" gain {_meter(lane.gain)} {_loop_display(lane, self.transport):<11.11}"
-        wave_width = max(4, width - len(prefix) - len(info) - len(suffix))
+        info = Text()
+        info.append(f"{lane.name:<{LANE_GUTTER}}", style="bold yellow" if warnings else f"bold {accent}")
+        info.append(f"{label:<12.12} {role:<6.6} {key:<4.4}", style="grey70")
+        info.append(f" gain {_meter(lane.gain)} ", style="grey62")
+        info.append(f"{_loop_display(lane, self.transport):<11.11}", style="grey62")
+        if warnings:
+            info.append(" " + warnings[0], style="yellow")
+        info.truncate(width)
 
-        text.append(prefix, style=name_style)
-        text.append(info, style="grey70")
-        text.append_text(self._wave_segment(lane, wave_width, accent))
-        text.append(suffix, style="grey62")
-        text.append("\n")
+        top, bottom = self._wave_rows(lane, axis, heads, accent)
+        return [info, top, bottom]
 
-    def _wave_segment(self, lane: Lane, width: int, accent: str) -> Text:
-        segment = Text()
+    def _wave_rows(self, lane: Lane, axis: WaveAxis, heads: dict[int, str], accent: str) -> tuple[Text, Text]:
+        """Two rows stacked into one bar per column: the bottom row fills up
+        to half amplitude, the top row shows the rest."""
+        top = Text(" " * axis.left)
+        bottom = Text(" " * axis.left)
         snippet = lane.snippet
         local_now = None if snippet is None else lane.local_beat(self.transport)
-        if snippet is None or local_now is None:
-            segment.append(" " * width, style="grey37")
-            return segment
+        half_col = 0.5 / QUARTER_COLS_PER_BEAT
 
-        center = width // 2
-        for x in range(width):
-            offset_beats = (x - center) / QUARTER_COLS_PER_BEAT
-            local = local_now + offset_beats
-            if snippet.loop:
-                local_wrapped = local % snippet.length_beats
-                visible = True
-            else:
-                visible = 0.0 <= local < snippet.length_beats
-                local_wrapped = local
-            if not visible:
-                segment.append(" ")
+        for col in axis.columns():
+            tint = {"bar": " on grey15", "beat": ""}.get(heads.get(col, ""), "")
+            if snippet is None or local_now is None:
+                top.append(" ", style=f"grey37{tint}" if tint else "")
+                bottom.append(" ", style=f"grey37{tint}" if tint else "")
                 continue
-            track_beat = snippet.start_beat + local_wrapped
-            amp = snippet.track.amplitude_at_beat(track_beat)
-            level = round(amp * (len(BAR_CHARS) - 1))
-            style = f"bold {accent}" if x < center else "grey50"
-            segment.append(BAR_CHARS[level], style=style)
-        return segment
+            local = local_now + axis.offset_beats(col)
+            amp = _column_amplitude(snippet, local - half_col, local + half_col)
+            base = f"bold {accent}" if col < axis.center else "grey50"
+            style = base + tint
+            if amp is None:
+                top.append(" ", style=style)
+                bottom.append(" ", style=style)
+                continue
+            levels = len(BAR_CHARS) - 1
+            top.append(BAR_CHARS[round(max(0.0, min(1.0, amp * 2 - 1)) * levels)], style=style)
+            bottom.append(BAR_CHARS[round(max(0.0, min(1.0, amp * 2)) * levels)], style=style)
+        return top, bottom
 
 
 class DJApp(App):
@@ -238,12 +299,14 @@ class DJApp(App):
 
         tracks_table = self.query_one("#tracks-table", DataTable)
         tracks_table.cursor_type = "row"
+        # Column widths + 2 cells of padding per column must fit the pane's
+        # inner width minus a vertical scrollbar (see LIBRARY_PANE_WIDTH).
         tracks_table.add_column("#", width=3)
-        tracks_table.add_column("Title", width=16)
-        tracks_table.add_column("Artist", width=14)
+        tracks_table.add_column("Title", width=14)
+        tracks_table.add_column("Artist", width=10)
         tracks_table.add_column("BPM", width=5)
-        tracks_table.add_column("Key", width=4)
-        tracks_table.add_column("Time", width=6)
+        tracks_table.add_column("Key", width=3)
+        tracks_table.add_column("Time", width=5)
         for t in self.library:
             m, s = divmod(int(t.duration), 60)
             tracks_table.add_row(str(t.id), t.title, t.artist, f"{t.bpm:.0f}", t.key, f"{m}:{s:02d}")
@@ -251,10 +314,10 @@ class DJApp(App):
         snips_table = self.query_one("#snips-table", DataTable)
         snips_table.cursor_type = "row"
         snips_table.add_column("Name", width=8)
-        snips_table.add_column("Track", width=16)
-        snips_table.add_column("Bars", width=5)
-        snips_table.add_column("Role", width=7)
-        snips_table.add_column("Key", width=4)
+        snips_table.add_column("Track", width=14)
+        snips_table.add_column("Bars", width=4)
+        snips_table.add_column("Role", width=6)
+        snips_table.add_column("Key", width=3)
         snips_table.add_column("Loop", width=5)
 
         self.query_one("#console-log", RichLog).write(
@@ -287,7 +350,11 @@ class DJApp(App):
         self._refresh_all()
 
     def _refresh_all(self) -> None:
-        self.query_one("#lanes-view", LanesView).refresh_view()
+        try:
+            lanes_view = self.query_one("#lanes-view", LanesView)
+        except NoMatches:  # the interval timer can fire once more while the app shuts down
+            return
+        lanes_view.refresh_view()
         self._refresh_snips_table()
         self._refresh_queue()
 

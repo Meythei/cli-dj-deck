@@ -7,7 +7,7 @@ Screen {
 }
 
 #library-pane {
-    width: 52;
+    width: 56;  /* 54 inner: 2 scrollbar + 6 columns x (width + 2 padding) */
     border: round $primary;
     border-title-align: center;
     border-title-color: $primary;
@@ -51,7 +51,7 @@ Screen {
 }
 
 #lanes-view {
-    height: 1fr;
+    height: auto;
     border: round $accent;
     border-title-align: center;
     border-title-color: $accent;
