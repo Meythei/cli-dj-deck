@@ -30,9 +30,12 @@ class Lane:
     mid: float = 1.0
     hi: float = 1.0
 
-    def start_snippet(self, snippet: Snippet, transport: Transport) -> None:
+    def start_snippet(self, snippet: Snippet, start_beat: float) -> None:
+        """Start `snippet` at an explicit transport beat -- the beat the play
+        was scheduled for, never "wherever the transport happens to be" when
+        the command got processed."""
         self.snippet = snippet
-        self.started_at_beat = transport.position_beats
+        self.started_at_beat = start_beat
         self.gain = 1.0
 
     def stop(self) -> None:

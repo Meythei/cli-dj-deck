@@ -12,7 +12,9 @@ While a Thunk is firing (including a `now(...)` firing synchronously right
 away), `_in_scheduled_context` is set so that nested lane/xf/bpm commands run
 immediately instead of re-quantizing to *another* future boundary -- once
 something has been scheduled for a precise beat, what's inside it should
-happen exactly then, not be deferred a second time.
+happen exactly then, not be deferred a second time. "Exactly then" means the
+beat the event was scheduled for (`Scheduler.firing_beat`), not the position
+of the tick that happened to notice it.
 """
 from __future__ import annotations
 
@@ -104,7 +106,20 @@ def _validate(tree: ast.AST) -> None:
             raise CommandError("only unary '-' is supported")
 
 
+def _is_unnamed_snip_call(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "snip"
+        and not any(kw.arg == "name" for kw in node.keywords)
+    )
+
+
 class Interpreter:
+    # A set file that load_set()s itself (directly or through others) would
+    # otherwise recurse until Python's own limit, logging all the way down.
+    MAX_SET_NESTING = 8
+
     def __init__(
         self,
         transport: Transport,
@@ -124,6 +139,8 @@ class Interpreter:
         self.on_clear = on_clear
         self.quant_mode = "bar"
         self._in_scheduled_context = False
+        self._snip_name_hint: Optional[str] = None
+        self._set_depth = 0
 
         self.env: dict[str, object] = dict(lanes)
         self.functions: dict[str, Callable] = self._build_functions()
@@ -165,7 +182,12 @@ class Interpreter:
                 raise CommandError(f"cannot assign to '{name}'")
             if name in self.reserved_names:
                 raise CommandError(f"cannot reassign built-in name '{name}'")
-            self.env[name] = self._eval(stmt.value)
+            # `kick = snip(...)` names the snippet "kick" unless name= says otherwise.
+            self._snip_name_hint = name if _is_unnamed_snip_call(stmt.value) else None
+            try:
+                self.env[name] = self._eval(stmt.value)
+            finally:
+                self._snip_name_hint = None
             return
         if isinstance(stmt, ast.Expr):
             self._eval(stmt.value)
@@ -239,33 +261,65 @@ class Interpreter:
         if not isinstance(n, (int, float)) or isinstance(n, bool):
             raise CommandError(f"{fname}()'s first argument must be a number")
         thunk = Thunk(self, node.args[1], ast.unparse(node.args[1]))
+        label = f"{fname}({n:g}, {thunk})"
 
         try:
             if fname == "at":
-                return self.scheduler.schedule_at(self.transport.beats_at_bar(n), thunk, str(thunk))
-            if fname == "after":
-                return self.scheduler.schedule_after_bars(n, thunk, str(thunk))
-            return self.scheduler.schedule_every_bars(n, thunk, str(thunk))
+                if n < 1:
+                    raise CommandError("at() takes a 1-based bar number (>= 1)")
+                event_id = self.scheduler.schedule_at(self.transport.beats_at_bar(n), thunk, str(thunk))
+            elif fname == "after":
+                event_id = self.scheduler.schedule_after_bars(n, thunk, str(thunk))
+            else:
+                event_id = self.scheduler.schedule_every_bars(n, thunk, str(thunk))
         except SchedulerError as exc:
             raise CommandError(str(exc)) from None
 
+        fire_at = next(beat for eid, beat, _ in self.scheduler.pending() if eid == event_id)
+        bar = self.transport.bar_at(fire_at)
+        if fname == "every":
+            self.log(f"{label} queued #{event_id}, every {n:g} bars from bar {bar}", "info")
+        else:
+            self.log(f"{label} queued #{event_id} @ bar {bar}", "info")
+        return event_id
+
     # ---- quantized dispatch, shared by lane play/stop and xf -----------------
 
-    def _quantized(self, description: str, action: Callable[[], None]) -> int:
-        """Ambient-quantized scheduling, except once we're already running
-        inside a scheduled Thunk (an at/after/every/now firing): then the
-        beat has already been chosen by the outer schedule, so just run."""
-        if self._in_scheduled_context:
-            action()
-            return -1
-        return self.scheduler.schedule_default(self.quant_mode, action, description)
+    def _quantized(self, description: str, action: Callable[[float], None]) -> None:
+        """Run `action(start_beat)` at the right beat, logging *before* it runs
+        so the command always appears ahead of whatever the action logs.
 
-    def _log_scheduled(self, description: str, event_id: int) -> None:
-        if event_id == -1:
-            self.log(f"{description} (now)", "info")
+        - inside a fired at/after/every: at the event's scheduled beat, now
+        - inside now(...), or with quant("none"): at the current position, now
+        - transport stopped: immediately (no boundary is coming in real time)
+        - otherwise: queued for the next boundary of the quantize mode
+        """
+        if self._in_scheduled_context:
+            fired = self.scheduler.firing_beat
+            if fired is None:
+                self.log(f"{description} (now)", "info")
+                action(self.transport.position_beats)
+            else:
+                self.log(f"[{self.transport.display_at(fired)}] {description}", "info")
+                action(fired)
             return
+        if not self.transport.running:
+            self.log(f"{description} (immediate)", "info")
+            action(self.transport.position_beats)
+            return
+        if self.quant_mode == "none":
+            self.log(f"{description} (now)", "info")
+            action(self.transport.position_beats)
+            return
+
+        def fire() -> None:
+            beat = self.scheduler.firing_beat
+            self.log(f"[{self.transport.display_at(beat)}] {description}", "info")
+            action(beat)
+
         target = self.transport.next_boundary_beats(self.quant_mode)
-        self.log(f"{description} @ bar {self.transport.bar_at(target)}", "info")
+        event_id = self.scheduler.schedule_at(target, fire, description)
+        self.log(f"{description} queued #{event_id} @ bar {self.transport.bar_at(target)}", "info")
 
     # ---- lane commands ---------------------------------------------------
 
@@ -274,18 +328,17 @@ class Interpreter:
             raise CommandError(f"{lane.name} can only play a snippet (got {type(snippet).__name__})")
         description = f"{lane.name} << {snippet.name}"
 
-        def action() -> None:
-            lane.start_snippet(snippet, self.transport)
+        def action(start_beat: float) -> None:
+            lane.start_snippet(snippet, start_beat)
             others = [other for name, other in self.lanes.items() if name != lane.name]
             for message in check_warnings(lane, others, self.transport.bpm):
                 self.log(message, "warn")
             self.log(f"{lane.name} now playing {snippet.name}", "info")
 
-        self._log_scheduled(description, self._quantized(description, action))
+        self._quantized(description, action)
 
     def _lane_stop(self, lane: Lane) -> None:
-        description = f"{lane.name}.stop()"
-        self._log_scheduled(description, self._quantized(description, lane.stop))
+        self._quantized(f"{lane.name}.stop()", lambda _beat: lane.stop())
 
     def _lane_gain(self, lane: Lane, value) -> None:
         lane.gain = max(0.0, min(1.0, float(value)))
@@ -329,6 +382,9 @@ class Interpreter:
     def _cmd_start(self) -> None:
         self.transport.start()
         self.log("transport running", "info")
+        # Anything reserved exactly at the position we're starting from (e.g.
+        # at(1, ...) typed before start()) belongs to this very moment.
+        self.scheduler.poll(self.transport.position_beats)
 
     def _cmd_stop(self) -> None:
         self.transport.stop()
@@ -359,6 +415,8 @@ class Interpreter:
         self.log(f"quant -> {mode}", "info")
 
     def _cmd_snip(self, track, *, cue=None, bar=None, bars=8, loop=False, role="other", name=None):
+        if name is None:
+            name = self._snip_name_hint
         if name is not None and name in self.reserved_names:
             raise CommandError(f"cannot name a snippet '{name}', it's a built-in")
         try:
@@ -379,11 +437,11 @@ class Interpreter:
             raise CommandError("xf(from_lane, to_lane, bars=...) needs two lanes")
         description = f"xf({from_lane.name}, {to_lane.name}, {bars:g})"
 
-        def action() -> None:
-            self.scheduler.start_automation(from_lane, to_lane, float(bars), description)
+        def action(start_beat: float) -> None:
+            self.scheduler.start_automation(from_lane, to_lane, float(bars), description, start_beat=start_beat)
             self.log(f"{description} started", "info")
 
-        self._log_scheduled(description, self._quantized(description, action))
+        self._quantized(description, action)
 
     def _cmd_queue(self) -> None:
         items = self.scheduler.pending(limit=5)
@@ -417,8 +475,17 @@ class Interpreter:
         path = self.sets_dir / f"{name}.djs"
         if not path.is_file():
             raise CommandError(f"set file not found: {path.name}")
+        if self._set_depth >= self.MAX_SET_NESTING:
+            raise CommandError(
+                f"load_set('{name}'): sets nest more than {self.MAX_SET_NESTING} deep "
+                "(does a set load itself?)"
+            )
         self.log(f"loading set '{name}'", "info")
-        self.run(path.read_text(encoding="utf-8"))
+        self._set_depth += 1
+        try:
+            self.run(path.read_text(encoding="utf-8"))
+        finally:
+            self._set_depth -= 1
 
     def _cmd_clear(self) -> None:
         self.on_clear()

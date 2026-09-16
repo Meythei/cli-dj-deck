@@ -135,7 +135,7 @@ def test_xf_gain_interpolates_start_mid_end_and_stops_from_lane():
     _, log = make_log()
     scheduler = Scheduler(transport, log)
     lane_a, lane_b = Lane("L1"), Lane("L2")
-    lane_a.start_snippet(make_snippet_for_lane(), transport)
+    lane_a.start_snippet(make_snippet_for_lane(), transport.position_beats)
     lane_a.gain = 1.0
 
     scheduler.start_automation(lane_a, lane_b, bars=4, description="xf")  # 16 beats = 16s

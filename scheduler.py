@@ -1,10 +1,16 @@
 """Quantized scheduler: turns "do X at the next bar" into an actual queue.
 
-Everything here reads time from a Transport and nothing else. A tick
-processes whatever beat range the Transport just advanced through, firing
-every event whose time falls in `(prev, now]` -- including, in a single big
-tick, several boundaries at once (a paused/slow UI shouldn't cause events to
-be skipped, only to fire late but in the right order).
+Everything here reads time from a Transport and nothing else. `poll(limit)`
+fires every event whose time is at or before `limit`, in time order --
+including, after one big tick, several boundaries at once (a paused/slow UI
+shouldn't cause events to be skipped, only to fire late but in the right
+order).
+
+While an event's action runs, `firing_beat` holds the beat the event was
+*scheduled* for. Actions must use that as their start beat rather than the
+transport's current position: the tick that crosses a boundary almost always
+overshoots it, and a lane started from the overshoot position would be a few
+dozen milliseconds late for good.
 """
 from __future__ import annotations
 
@@ -12,9 +18,13 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from lanes import Lane
-from transport import Transport
+from transport import EPSILON, Transport
 
 LogFn = Callable[[str, str], None]  # (message, level) where level in info/warn/error
+
+# Smallest every() interval, in beats. Anything smaller is never musically
+# useful and, with a long enough stall, turns one poll into a busy loop.
+MIN_EVERY_BEATS = 1.0
 
 
 class SchedulerError(Exception):
@@ -42,11 +52,17 @@ class Automation:
 
 
 class Scheduler:
+    # Safety valve: one poll never fires more than this many events. The rest
+    # stay queued for the next poll, so the UI keeps drawing and can be used
+    # to cancel() whatever is flooding the queue.
+    MAX_FIRES_PER_POLL = 256
+
     def __init__(self, transport: Transport, log: LogFn) -> None:
         self.transport = transport
         self.log = log
         self.events: list[ScheduledEvent] = []
         self.automations: list[Automation] = []
+        self.firing_beat: Optional[float] = None
         self._next_id = 1
         self._recurring_active: dict[int, bool] = {}
         self._lane_automation: dict[str, int] = {}  # lane name -> automation id targeting its gain
@@ -59,18 +75,26 @@ class Scheduler:
     # ---- scheduling entry points -------------------------------------------------
 
     def schedule_default(self, quant_mode: str, action: Callable[[], None], description: str) -> int:
-        """Ambient-quantized scheduling used by lane play/stop and xf: the
-        next boundary of `quant_mode`, or immediately if the transport is
-        stopped (there is no future boundary arriving in real time)."""
+        """Ambient-quantized scheduling: the next boundary of `quant_mode`, or
+        immediately if the transport is stopped (there is no future boundary
+        arriving in real time)."""
         if not self.transport.running:
-            self._run(action, description)
+            self._run(action, description, self.transport.position_beats)
             return -1
         target = self.transport.next_boundary_beats(quant_mode)
         return self._enqueue(target, action, description)
 
     def schedule_at(self, target_beats: float, action: Callable[[], None], description: str) -> int:
-        """Schedule for an absolute beat position (used by at() and bpm())."""
-        if target_beats <= self.transport.position_beats:
+        """Schedule for an absolute beat position (used by at() and bpm()).
+
+        A target behind the transport is moved to the next bar with a
+        warning. A target exactly *at* a stopped transport's position is not
+        in the past -- it fires the moment the transport starts."""
+        position = self.transport.position_beats
+        passed = target_beats < position - EPSILON or (
+            self.transport.running and target_beats <= position + EPSILON
+        )
+        if passed:
             fallback = self.transport.next_boundary_beats("bar")
             bar = self.transport.bar_at(fallback)
             self.log(f"{description}: target already passed, rescheduled to bar {bar}", "warn")
@@ -78,22 +102,30 @@ class Scheduler:
         return self._enqueue(target_beats, action, description)
 
     def schedule_after_bars(self, bars: float, action: Callable[[], None], description: str) -> int:
-        target = self.transport.next_boundary_beats("bar") + bars * self.transport.beats_per_bar
-        return self._enqueue(target, action, description)
+        if bars < 0:
+            raise SchedulerError("after() needs a bar count >= 0 (it cannot schedule into the past)")
+        return self._enqueue(self.after_bars_target(bars), action, description)
+
+    def after_bars_target(self, bars: float) -> float:
+        return self.transport.next_boundary_beats("bar") + bars * self.transport.beats_per_bar
 
     def schedule_every_bars(self, bars: float, action: Callable[[], None], description: str) -> int:
-        if bars <= 0:
-            raise SchedulerError("every() needs a positive number of bars")
+        if bars * self.transport.beats_per_bar < MIN_EVERY_BEATS - EPSILON:
+            minimum = MIN_EVERY_BEATS / self.transport.beats_per_bar
+            raise SchedulerError(f"every() needs an interval of at least {minimum:g} bars (1 beat)")
         event_id = self._new_id()
         self._recurring_active[event_id] = True
         target = self.transport.next_boundary_beats("bar")
         self.events.append(ScheduledEvent(event_id, target, action, description, recurring_bars=bars))
         return event_id
 
-    def start_automation(self, from_lane: Lane, to_lane: Lane, bars: float, description: str) -> int:
+    def start_automation(
+        self, from_lane: Lane, to_lane: Lane, bars: float, description: str, start_beat: Optional[float] = None
+    ) -> int:
         """Linear crossfade: from_lane.gain current->0, to_lane.gain 0->1,
-        over `bars` bars starting now. Overriding an in-flight automation on
-        either lane logs a warning and replaces it."""
+        over `bars` bars from `start_beat` (default: the beat of the event
+        currently firing, else the transport position). Overriding an
+        in-flight automation on either lane logs a warning and replaces it."""
         for lane in (from_lane, to_lane):
             existing = self._lane_automation.get(lane.name)
             if existing is not None:
@@ -101,8 +133,9 @@ class Scheduler:
                 self.automations = [a for a in self.automations if a.id != existing]
                 self._lane_automation.pop(lane.name, None)
 
+        if start_beat is None:
+            start_beat = self.firing_beat if self.firing_beat is not None else self.transport.position_beats
         automation_id = self._new_id()
-        start_beat = self.transport.position_beats
         automation = Automation(
             id=automation_id,
             from_lane=from_lane,
@@ -121,35 +154,56 @@ class Scheduler:
     # ---- per-frame update ----------------------------------------------------
 
     def tick(self, dt_seconds: float) -> None:
-        prev, now = self.transport.advance(dt_seconds)
-        self._advance_automations(prev, now)
+        _, now = self.transport.advance(dt_seconds)
+        self.poll(now)
+        self._advance_automations(now)
+
+    def poll(self, limit_beats: float) -> int:
+        """Fire every queued event scheduled at or before `limit_beats`, in
+        (beat, id) order. A stopped transport fires nothing: events sitting
+        exactly at its position wait for start(), which polls again. Returns
+        the number of events fired."""
+        if not self.transport.running:
+            return 0
+        fired = 0
         # Loop rather than a single pass: a recurring event's freshly
-        # rescheduled next occurrence can itself fall inside a large (prev, now]
-        # jump, and must fire in the same tick rather than waiting a frame.
+        # rescheduled next occurrence can itself be due in the same poll.
         while True:
-            due = [e for e in self.events if prev < e.fire_at_beats <= now]
+            due = [e for e in self.events if e.fire_at_beats <= limit_beats + EPSILON]
             if not due:
-                break
+                return fired
             due.sort(key=lambda e: (e.fire_at_beats, e.id))
             for event in due:
+                if fired >= self.MAX_FIRES_PER_POLL:
+                    self.log(
+                        f"scheduler: fired {fired} events in one tick; deferring the rest "
+                        "(cancel() a runaway every() if this repeats)",
+                        "error",
+                    )
+                    return fired
                 self.events.remove(event)
                 self._fire(event)
+                fired += 1
 
     def _fire(self, event: ScheduledEvent) -> None:
-        self._run(event.action, event.description)
+        self._run(event.action, event.description, event.fire_at_beats)
         if event.recurring_bars is not None and self._recurring_active.get(event.id, False):
             next_target = event.fire_at_beats + event.recurring_bars * self.transport.beats_per_bar
             self.events.append(
                 ScheduledEvent(event.id, next_target, event.action, event.description, event.recurring_bars)
             )
 
-    def _run(self, action: Callable[[], None], description: str) -> None:
+    def _run(self, action: Callable[[], None], description: str, beat: float) -> None:
+        previous = self.firing_beat
+        self.firing_beat = beat
         try:
             action()
         except Exception as exc:  # noqa: BLE001 -- one bad command must not kill the set
             self.log(f"error running '{description}': {exc}", "error")
+        finally:
+            self.firing_beat = previous
 
-    def _advance_automations(self, prev: float, now: float) -> None:
+    def _advance_automations(self, now: float) -> None:
         finished = []
         for automation in self.automations:
             span = automation.end_beat - automation.start_beat
