@@ -190,3 +190,17 @@ def test_load_set_missing_file_is_an_error():
     interp, *_, logs = make_interp(sets_dir=Path("."))
     interp.run('load_set("does_not_exist")')
     assert has_error(logs)
+
+
+def test_demo_set_loads_with_expected_snippets_and_events():
+    sets_dir = Path(__file__).resolve().parents[1] / "sets"
+    interp, transport, scheduler, lanes, logs = make_interp(sets_dir=sets_dir)
+    interp.run('load_set("demo")')
+
+    assert not has_error(logs), [msg for level, msg in logs if level == "error"]
+    for name in ("kick", "bass", "hook", "riser", "drop"):
+        assert name in interp.env, f"missing snippet '{name}'"
+
+    assert transport.bpm == pytest.approx(128.0)
+    assert lanes["L1"].snippet is interp.env["kick"]  # bare command ran immediately (stopped)
+    assert len(scheduler.pending()) == 5  # the five at(...) reservations

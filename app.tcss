@@ -7,13 +7,18 @@ Screen {
 }
 
 #library-pane {
-    width: 48;
+    width: 52;
     border: round $primary;
     border-title-align: center;
     border-title-color: $primary;
 }
 
-#library-table {
+#library-tabs {
+    height: 1fr;
+}
+
+#tracks-table,
+#snips-table {
     height: 1fr;
 }
 
@@ -32,29 +37,23 @@ Screen {
     height: 1fr;
 }
 
+#queue-view {
+    height: auto;
+    max-height: 7;
+    border-top: solid $primary;
+    padding: 0 1;
+}
+
 #command-input {
     dock: bottom;
     border: none;
     border-top: solid $primary;
 }
 
-#decks-pane {
-    height: auto;
-}
-
-DeckView {
-    height: 5;
-    padding: 0 1;
+#lanes-view {
+    height: 1fr;
+    border: round $accent;
     border-title-align: center;
-}
-
-#deck-a {
-    border: round cyan;
-    border-title-color: cyan;
-    margin-bottom: 1;
-}
-
-#deck-b {
-    border: round magenta;
-    border-title-color: magenta;
+    border-title-color: $accent;
+    padding: 0 1;
 }
