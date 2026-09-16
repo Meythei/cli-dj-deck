@@ -29,7 +29,6 @@ from ..config import Config, Paths
 from ..interpreter import Interpreter
 from ..lanes import LANE_NAMES, Lane, check_warnings
 from ..library import SAMPLES_PER_BEAT, Track
-from ..scheduler import Scheduler
 from ..session import Session
 from ..snippets import BEATS_PER_BAR as SNIPPET_BEATS_PER_BAR
 from ..snippets import Snippet
@@ -254,6 +253,7 @@ class LanesView(Static):
 
 
 TRACK_STATUS_GLYPHS = {"demo": " ", "new": "·", "analyzing": "…", "ready": "✓", "failed": "✗", "missing": "?"}
+PREP_GLYPHS = {"none": "·", "pending": "…", "ready": "✓", "failed": "✗"}
 
 
 class DJApp(App):
@@ -268,17 +268,18 @@ class DJApp(App):
         paths: Paths | None = None,
         config: Config | None = None,
         jobs=None,
+        audio: bool = False,
     ) -> None:
         super().__init__()
         self._set_path = set_path
         self._pending_log: list[tuple[str, str]] = []
         self.paths = paths or Paths.default()
         self.config = config or Config.load(self.paths)
-        self.session = Session(self.paths, self.config, self._log, demo=demo, jobs=jobs)
+        self.session = Session(self.paths, self.config, self._log, demo=demo, jobs=jobs, prepare=audio)
         self.library: list[Track] = self.session.tracks
-        self.transport = Transport()
-        self.lanes: dict[str, Lane] = {name: Lane(name) for name in LANE_NAMES}
-        self.scheduler = Scheduler(self.transport, self._log)
+        self.transport = self.session.transport
+        self.lanes: dict[str, Lane] = self.session.lanes
+        self.scheduler = self.session.scheduler
         self.interp = Interpreter(
             self.transport,
             self.scheduler,
@@ -291,6 +292,7 @@ class DJApp(App):
         )
         self._last_tick = time.monotonic()
         self._tracks_version = -1
+        self._snips_signature: tuple = ()
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="root"):
@@ -331,16 +333,18 @@ class DJApp(App):
 
         snips_table = self.query_one("#snips-table", DataTable)
         snips_table.cursor_type = "row"
+        snips_table.add_column("", width=1)  # preparation status glyph
         snips_table.add_column("Name", width=8)
-        snips_table.add_column("Track", width=14)
+        snips_table.add_column("Track", width=13)
         snips_table.add_column("Bars", width=4)
-        snips_table.add_column("Role", width=6)
+        snips_table.add_column("Role", width=5)
         snips_table.add_column("Key", width=3)
-        snips_table.add_column("Loop", width=5)
+        snips_table.add_column("Loop", width=4)
 
         mode = "demo library" if self.session.demo else f"library: {len(self.library)} track(s)"
+        prep = "snippets are pre-rendered" if self.session.preparing else "--no-audio: visual only"
         self.query_one("#console-log", RichLog).write(
-            f"[bold]cli-dj[/] — snippet-driven live coding, visual only ({mode}). type help() and press Enter"
+            f"[bold]cli-dj[/] — snippet-driven live coding ({mode}; {prep}). type help() and press Enter"
         )
         for message, level in self._pending_log:
             self._log(message, level)
@@ -371,10 +375,7 @@ class DJApp(App):
         now = time.monotonic()
         dt = now - self._last_tick
         self._last_tick = now
-        self.session.poll()
-        self.scheduler.tick(dt)
-        for lane in self.lanes.values():
-            lane.update(self.transport)
+        self.session.tick(dt)
         self._refresh_all()
 
     def _refresh_all(self) -> None:
@@ -406,16 +407,20 @@ class DJApp(App):
 
     def _refresh_snips_table(self) -> None:
         table = self.query_one("#snips-table", DataTable)
-        names = [name for name, value in self.interp.env.items() if isinstance(value, Snippet)]
-        if table.row_count != len(names):
-            table.clear()
-            for name in names:
-                snippet = self.interp.env[name]
-                bars = snippet.length_beats / SNIPPET_BEATS_PER_BAR
-                table.add_row(
-                    name, snippet.track.title, f"{bars:g}", snippet.role, snippet.key,
-                    "yes" if snippet.loop else "no",
-                )
+        entries = [(name, value) for name, value in self.interp.env.items() if isinstance(value, Snippet)]
+        bpm = self.session.pending_bpm or self.transport.bpm
+        states = [self.session.prep_state(snippet, bpm) if self.session.preparing else "" for _, snippet in entries]
+        signature = tuple((name, id(snippet), state) for (name, snippet), state in zip(entries, states))
+        if signature == self._snips_signature:
+            return
+        self._snips_signature = signature
+        table.clear()
+        for (name, snippet), state in zip(entries, states):
+            bars = snippet.length_beats / SNIPPET_BEATS_PER_BAR
+            table.add_row(
+                PREP_GLYPHS.get(state, " "), name, snippet.track.title, f"{bars:g}", snippet.role, snippet.key,
+                "yes" if snippet.loop else "no",
+            )
 
     def _refresh_queue(self) -> None:
         view = self.query_one("#queue-view", Static)
@@ -463,9 +468,10 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="python -m clidj", description="cli-dj: live-coding DJ TUI")
     parser.add_argument("--set", dest="set_path", default=None, help="path to a .djs set file to load at startup")
     parser.add_argument("--demo", action="store_true", help="use the built-in demo library instead of your music")
+    parser.add_argument("--no-audio", action="store_true", help="visual only: no rendering, no audio device")
     args = parser.parse_args(argv)
     set_path = Path(args.set_path) if args.set_path else None
-    DJApp(set_path=set_path, demo=args.demo).run()
+    DJApp(set_path=set_path, demo=args.demo, audio=not args.no_audio).run()
 
 
 if __name__ == "__main__":

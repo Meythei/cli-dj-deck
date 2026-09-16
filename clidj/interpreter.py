@@ -56,6 +56,7 @@ HELP_TEXT = """commands:
   queue()                        list pending events
   cancel(3) / cancel()           cancel one event, or everything
   snips()                        list defined snippets
+  prep()                         render every defined snippet at the current BPM
   tracks()                       list the library (number, BPM, key, status)
   scan() / scan(retry=True)      rescan library folders, analyse new (and failed) tracks
   regrid(3, bpm=127.98, offset_ms=12)   fix a track's beat grid (saved as an override)
@@ -335,6 +336,11 @@ class Interpreter:
         description = f"{lane.name} << {snippet.name}"
 
         def action(start_beat: float) -> None:
+            if self.session is not None and not self.session.ready_to_play(snippet):
+                # Never start silently: wait for the render, then re-issue the
+                # play so it lands on the first boundary after it's ready.
+                self.session.hold(snippet, description, lambda: self._lane_play(lane, snippet))
+                return
             lane.start_snippet(snippet, start_beat)
             others = [other for name, other in self.lanes.items() if name != lane.name]
             for message in check_warnings(lane, others, self.transport.bpm):
@@ -380,6 +386,7 @@ class Interpreter:
             "queue": self._cmd_queue,
             "cancel": self._cmd_cancel,
             "snips": self._cmd_snips,
+            "prep": self._cmd_prep,
             "tracks": self._cmd_tracks,
             "scan": self._cmd_scan,
             "regrid": self._cmd_regrid,
@@ -404,6 +411,9 @@ class Interpreter:
         value = float(value)
         if value <= 0:
             raise CommandError("bpm must be positive")
+        if self.session is not None:
+            self.session.request_bpm(value, in_scheduled_context=self._in_scheduled_context)
+            return
         if self._in_scheduled_context or not self.transport.running:
             self.transport.bpm = value
             self.log(f"bpm -> {value:.1f}", "info")
@@ -435,6 +445,8 @@ class Interpreter:
             )
         except snippets.SnippetError as exc:
             raise CommandError(str(exc)) from None
+        if self.session is not None:
+            self.session.register_snippet(snippet)
         self.log(
             f"{snippet.name} = {snippet.track.title} "
             f"[{snippet.start_beat:g}+{snippet.length_beats:g} beats] role={snippet.role}",
@@ -485,6 +497,9 @@ class Interpreter:
         if self.session is None:
             raise CommandError(f"{command}() needs a library session")
         return self.session
+
+    def _cmd_prep(self) -> None:
+        self._require_session("prep").prep_all()
 
     def _cmd_tracks(self) -> None:
         if not self.library:

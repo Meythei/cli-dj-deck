@@ -59,11 +59,12 @@ class Track:
     def duration_beats(self) -> float:
         if self.bpm <= 0:
             return 0.0
-        return max(0.0, (self.duration - self.first_beat) * self.bpm / 60.0) if self.path else self.duration * self.bpm / 60.0
+        return max(0.0, (self.duration - self.first_beat) * self.bpm / 60.0)
 
     @property
     def is_demo(self) -> bool:
-        return self.path is None
+        # Not "path is None": a demo track gets a path once its audio is synthesised.
+        return self.track_id.startswith("demo-")
 
     @property
     def playable(self) -> bool:

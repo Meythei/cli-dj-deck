@@ -30,6 +30,7 @@ class Snippet:
     loop: bool = False
     role: str = "other"
     gain: float = 1.0
+    uid: int = 0  # assigned by the Session when registered; identifies the snippet to prep and the engine
 
     @property
     def key(self) -> str:

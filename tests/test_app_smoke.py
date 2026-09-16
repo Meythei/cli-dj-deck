@@ -82,3 +82,26 @@ async def test_scan_in_the_app_fills_the_tracks_table_with_grid_and_status(tmp_p
         number, status, title, artist, bpm, key, length = table.get_row_at(0)
         assert (number, status, title, artist) == ("1", "✓", "Thing", "Someone")
         assert float(bpm) == 125.0
+
+
+async def test_snips_table_shows_preparation_state(tmp_path):
+    from clidj import synth
+    from clidj.config import Config, Paths
+    from clidj.library import Track
+    from clidj.workers import InlineJobRunner
+
+    source = synth.write_audio(tmp_path / "k.wav", synth.click_track(124.0, 0.2, 30.0, 48000, kind="kick"), 48000)
+    paths = Paths(tmp_path / "config", tmp_path / "data", tmp_path / "cache")
+    app = DJApp(demo=True, audio=True, paths=paths, config=Config(), jobs=InlineJobRunner())
+    app.session.tracks[:] = [Track(1, "Kicks", "T", 124.0, "8A", 30.0, first_beat=0.2, path=source,
+                                   track_id="kicks", status="ready")]
+    async with app.run_test(size=(140, 44)) as pilot:
+        await pilot.pause()
+        input_widget = app.query_one("#command-input")
+        input_widget.value = "kick = snip(1, bar=1, bars=2, loop=True)"
+        await pilot.press("enter")
+        await pilot.pause(0.2)
+        table = app.query_one("#snips-table")
+        assert table.row_count == 1
+        glyph, name, *_ = table.get_row_at(0)
+        assert (glyph, name) == ("✓", "kick")
