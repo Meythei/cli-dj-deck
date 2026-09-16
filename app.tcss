@@ -1,0 +1,60 @@
+Screen {
+    background: $surface;
+}
+
+#root {
+    height: 100%;
+}
+
+#library-pane {
+    width: 48;
+    border: round $primary;
+    border-title-align: center;
+    border-title-color: $primary;
+}
+
+#library-table {
+    height: 1fr;
+}
+
+#right-pane {
+    width: 1fr;
+}
+
+#console-pane {
+    height: 1fr;
+    border: round $primary;
+    border-title-align: center;
+    border-title-color: $primary;
+}
+
+#console-log {
+    height: 1fr;
+}
+
+#command-input {
+    dock: bottom;
+    border: none;
+    border-top: solid $primary;
+}
+
+#decks-pane {
+    height: auto;
+}
+
+DeckView {
+    height: 5;
+    padding: 0 1;
+    border-title-align: center;
+}
+
+#deck-a {
+    border: round cyan;
+    border-title-color: cyan;
+    margin-bottom: 1;
+}
+
+#deck-b {
+    border: round magenta;
+    border-title-color: magenta;
+}
