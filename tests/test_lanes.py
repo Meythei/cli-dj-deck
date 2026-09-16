@@ -1,9 +1,9 @@
 import pytest
 
-from lanes import Lane, check_warnings, keys_compatible
-from library import Track
-from snippets import Snippet
-from transport import Transport
+from clidj.lanes import Lane, check_warnings, keys_compatible
+from clidj.library import Track
+from clidj.snippets import Snippet
+from clidj.transport import Transport
 
 
 def make_snippet(loop=False, length_beats=16.0, role="drums", key="8A", bpm=128.0, start_beat=0.0):

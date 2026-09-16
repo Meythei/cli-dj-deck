@@ -11,8 +11,8 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
-from snippets import Snippet
-from transport import Transport
+from .snippets import Snippet
+from .transport import Transport
 
 LANE_NAMES: tuple[str, ...] = ("L1", "L2", "L3", "L4")
 

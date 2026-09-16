@@ -1,6 +1,6 @@
 import pytest
 
-from transport import Transport
+from clidj.transport import Transport
 
 
 def test_advance_reaches_next_bar_head():

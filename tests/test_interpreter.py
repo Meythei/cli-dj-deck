@@ -2,12 +2,12 @@ from pathlib import Path
 
 import pytest
 
-from interpreter import Interpreter
-from lanes import LANE_NAMES, Lane
-from library import DEMO_LIBRARY
-from scheduler import Scheduler
-from snippets import Snippet
-from transport import Transport
+from clidj.interpreter import Interpreter
+from clidj.lanes import LANE_NAMES, Lane
+from clidj.library import DEMO_LIBRARY
+from clidj.scheduler import Scheduler
+from clidj.snippets import Snippet
+from clidj.transport import Transport
 
 
 def make_interp(sets_dir: Path | None = None):

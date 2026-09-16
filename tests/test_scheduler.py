@@ -1,10 +1,10 @@
 import pytest
 
-from lanes import Lane
-from library import Track
-from scheduler import Scheduler, SchedulerError
-from snippets import Snippet
-from transport import Transport
+from clidj.lanes import Lane
+from clidj.library import Track
+from clidj.scheduler import Scheduler, SchedulerError
+from clidj.snippets import Snippet
+from clidj.transport import Transport
 
 
 def make_log():

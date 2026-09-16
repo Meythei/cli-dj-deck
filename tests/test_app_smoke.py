@@ -1,7 +1,7 @@
 import asyncio
 from pathlib import Path
 
-from app import DJApp
+from clidj.ui.app import DJApp
 
 DEMO_SET = Path(__file__).resolve().parents[1] / "sets" / "demo.djs"
 

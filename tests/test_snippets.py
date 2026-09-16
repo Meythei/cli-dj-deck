@@ -1,7 +1,7 @@
 import pytest
 
-from library import DEMO_LIBRARY, Track
-from snippets import SnippetError, snip
+from clidj.library import DEMO_LIBRARY, Track
+from clidj.snippets import SnippetError, snip
 
 
 def test_snip_from_cue_uses_cue_beat_position():

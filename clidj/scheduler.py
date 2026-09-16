@@ -17,8 +17,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-from lanes import Lane
-from transport import EPSILON, Transport
+from .lanes import Lane
+from .transport import EPSILON, Transport
 
 LogFn = Callable[[str, str], None]  # (message, level) where level in info/warn/error
 

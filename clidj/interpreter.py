@@ -22,11 +22,11 @@ import ast
 from pathlib import Path
 from typing import Callable, Optional
 
-import snippets
-from lanes import Lane, check_warnings
-from library import Track
-from scheduler import Scheduler, SchedulerError
-from transport import Transport
+from . import snippets
+from .lanes import Lane, check_warnings
+from .library import Track
+from .scheduler import Scheduler, SchedulerError
+from .transport import Transport
 
 LogFn = Callable[[str, str], None]
 

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from library import Track
+from .library import Track
 
 # Bar length assumed when cutting from a track's own bars (`bar=` / `bars=`).
 # This is about the *source track's* structure, not the live set's Transport,

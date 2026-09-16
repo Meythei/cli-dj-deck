@@ -5,11 +5,11 @@ from pathlib import Path
 
 import pytest
 
-from interpreter import Interpreter
-from lanes import LANE_NAMES, Lane
-from library import DEMO_LIBRARY
-from scheduler import Scheduler
-from transport import Transport
+from clidj.interpreter import Interpreter
+from clidj.lanes import LANE_NAMES, Lane
+from clidj.library import DEMO_LIBRARY
+from clidj.scheduler import Scheduler
+from clidj.transport import Transport
 
 SETS_DIR = Path(__file__).resolve().parents[1] / "sets"
 

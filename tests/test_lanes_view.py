@@ -3,11 +3,11 @@
 import pytest
 from textual.widgets import DataTable
 
-from app import DJApp, LanesView
-from lanes import LANE_NAMES, Lane
-from library import SAMPLES_PER_BEAT, Track
-from snippets import Snippet
-from transport import Transport
+from clidj.ui.app import DJApp, LanesView
+from clidj.lanes import LANE_NAMES, Lane
+from clidj.library import SAMPLES_PER_BEAT, Track
+from clidj.snippets import Snippet
+from clidj.transport import Transport
 
 
 def spiky_track() -> Track:
