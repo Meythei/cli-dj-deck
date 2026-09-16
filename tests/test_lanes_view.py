@@ -83,7 +83,7 @@ def test_each_lane_gets_an_info_row_and_waveform_rows():
 
 
 async def test_lanes_pane_is_sized_to_its_content_not_half_the_screen():
-    app = DJApp()
+    app = DJApp(demo=True)
     async with app.run_test(size=(140, 44)) as pilot:
         await pilot.pause()
         view = app.query_one("#lanes-view", LanesView)
@@ -92,7 +92,7 @@ async def test_lanes_pane_is_sized_to_its_content_not_half_the_screen():
 
 
 async def test_tracks_table_fits_the_library_pane_without_horizontal_scroll():
-    app = DJApp()
+    app = DJApp(demo=True)
     async with app.run_test(size=(140, 44)) as pilot:
         await pilot.pause()
         table = app.query_one("#tracks-table", DataTable)

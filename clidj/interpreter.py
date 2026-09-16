@@ -56,6 +56,10 @@ HELP_TEXT = """commands:
   queue()                        list pending events
   cancel(3) / cancel()           cancel one event, or everything
   snips()                        list defined snippets
+  tracks()                       list the library (number, BPM, key, status)
+  scan() / scan(retry=True)      rescan library folders, analyse new (and failed) tracks
+  regrid(3, bpm=127.98, offset_ms=12)   fix a track's beat grid (saved as an override)
+  setkey(3, "8A")                fix a track's key (saved as an override)
   load_set("demo")               run sets/demo.djs
   clear() / help()               clear the log / show this text""".strip()
 
@@ -129,6 +133,7 @@ class Interpreter:
         log: LogFn,
         sets_dir: Path,
         on_clear: Callable[[], None] = lambda: None,
+        session=None,
     ) -> None:
         self.transport = transport
         self.scheduler = scheduler
@@ -137,6 +142,7 @@ class Interpreter:
         self.log = log
         self.sets_dir = sets_dir
         self.on_clear = on_clear
+        self.session = session
         self.quant_mode = "bar"
         self._in_scheduled_context = False
         self._snip_name_hint: Optional[str] = None
@@ -374,6 +380,10 @@ class Interpreter:
             "queue": self._cmd_queue,
             "cancel": self._cmd_cancel,
             "snips": self._cmd_snips,
+            "tracks": self._cmd_tracks,
+            "scan": self._cmd_scan,
+            "regrid": self._cmd_regrid,
+            "setkey": self._cmd_setkey,
             "load_set": self._cmd_load_set,
             "clear": self._cmd_clear,
             "help": self._cmd_help,
@@ -470,6 +480,45 @@ class Interpreter:
                 f"key={snippet.key} loop={snippet.loop}",
                 "info",
             )
+
+    def _require_session(self, command: str):
+        if self.session is None:
+            raise CommandError(f"{command}() needs a library session")
+        return self.session
+
+    def _cmd_tracks(self) -> None:
+        if not self.library:
+            self.log("library is empty -- configure folders and run scan()", "info")
+            return
+        for track in self.library:
+            grid = f"{track.bpm:6.2f} BPM" if track.bpm > 0 else "   -- BPM"
+            self.log(f"#{track.id:<3} {grid} {track.key or '--':>3} {track.status:<9} {track.title}", "info")
+
+    def _cmd_scan(self, retry=False) -> None:
+        self._require_session("scan").scan(retry=bool(retry))
+
+    def _cmd_regrid(self, track, bpm=None, offset_ms=None, first_beat=None, reset=False) -> None:
+        from .session import SessionError
+
+        try:
+            updated = self._require_session("regrid").regrid(
+                track, bpm=bpm, offset_ms=offset_ms, first_beat=first_beat, reset=bool(reset)
+            )
+        except SessionError as exc:
+            raise CommandError(str(exc)) from None
+        self.log(
+            f"regrid #{updated.id} {updated.title}: {updated.bpm:.3f} BPM, beat 0 at {updated.first_beat * 1000:.1f} ms",
+            "info",
+        )
+
+    def _cmd_setkey(self, track, key) -> None:
+        from .session import SessionError
+
+        try:
+            updated = self._require_session("setkey").setkey(track, key)
+        except SessionError as exc:
+            raise CommandError(str(exc)) from None
+        self.log(f"setkey #{updated.id} {updated.title}: {updated.key}", "info")
 
     def _cmd_load_set(self, name: str) -> None:
         path = self.sets_dir / f"{name}.djs"

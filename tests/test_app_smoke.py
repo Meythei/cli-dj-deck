@@ -7,7 +7,7 @@ DEMO_SET = Path(__file__).resolve().parents[1] / "sets" / "demo.djs"
 
 
 async def test_app_boots_runs_and_transport_advances():
-    app = DJApp(set_path=DEMO_SET)
+    app = DJApp(set_path=DEMO_SET, demo=True)
     async with app.run_test(size=(140, 44)) as pilot:
         await pilot.pause()
 
@@ -28,7 +28,7 @@ async def test_app_boots_runs_and_transport_advances():
 
 
 async def test_app_history_and_error_path_do_not_crash():
-    app = DJApp()
+    app = DJApp(demo=True)
     async with app.run_test(size=(140, 44)) as pilot:
         await pilot.pause()
 
@@ -55,8 +55,30 @@ async def test_app_history_and_error_path_do_not_crash():
 
 
 async def test_app_without_set_path_starts_with_empty_lanes():
-    app = DJApp()
+    app = DJApp(demo=True)
     async with app.run_test(size=(140, 44)) as pilot:
         await pilot.pause()
         assert all(lane.snippet is None for lane in app.lanes.values())
         assert not app.transport.running
+
+
+async def test_scan_in_the_app_fills_the_tracks_table_with_grid_and_status(tmp_path):
+    from clidj import synth
+    from clidj.config import Config, Paths
+    from clidj.workers import InlineJobRunner
+
+    music = tmp_path / "music"
+    synth.write_audio(music / "Someone - Thing.flac", synth.techno_loop_track(125.0, 9, True, 30.0, 44100), 44100)
+    paths = Paths(tmp_path / "config", tmp_path / "data", tmp_path / "cache")
+    app = DJApp(paths=paths, config=Config(library_folders=[music]), jobs=InlineJobRunner())
+    async with app.run_test(size=(140, 44)) as pilot:
+        await pilot.pause()
+        input_widget = app.query_one("#command-input")
+        input_widget.value = "scan()"
+        await pilot.press("enter")
+        await pilot.pause(0.3)
+        table = app.query_one("#tracks-table")
+        assert table.row_count == 1
+        number, status, title, artist, bpm, key, length = table.get_row_at(0)
+        assert (number, status, title, artist) == ("1", "✓", "Thing", "Someone")
+        assert float(bpm) == 125.0

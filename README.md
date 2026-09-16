@@ -4,8 +4,9 @@ ghostty風にペイン分割されたターミナル上のDJツール。「曲�
 事前に切り出した短いスニペットを、共通の時計(Transport)の上で **コードとして** 展開していく
 スタイルを目指しています。FoxDot/TidalCycles のようなライブコーディング環境が近い見た目です。
 
-**音は一切鳴りません。** 波形・BPM・再生位置はすべてシミュレーションで、実際のオーディオ
-デコード/再生・BPM解析は行っていません(そのための設計上の空き所は残してあります。後述)。
+**現状(実オーディオ化の途中):** 自分の音声ファイルのライブラリを読み込み、BPM・ビートグリッド・キー・
+ラウドネス・波形をバックグラウンドで解析できます。**再生はまだビジュアルのシミュレーションで、音は鳴りません**
+(オーディオエンジンは [docs/plan.md](docs/plan.md) のフェーズD以降)。
 
 ## 起動
 
@@ -15,13 +16,41 @@ uv で入れた場合は `py -V:Astral/CPython3.13.14` で venv を作ります�
 ```bash
 py -3.13 -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
-.venv\Scripts\python app.py
+.venv\Scripts\python -m clidj
 ```
 
-デモセットを流し込んで起動する場合:
+`python app.py` でも同じものが起動します。フェイクのデモライブラリとデモセットで起動する場合:
 
 ```bash
-.venv\Scripts\python app.py --set sets/demo.djs
+.venv\Scripts\python -m clidj --demo --set sets/demo.djs
+```
+
+### 自分のライブラリを使う
+
+1. 一度起動すると設定ファイルの雛形ができます(Windows: `%LOCALAPPDATA%\cli-dj\config.toml`)
+2. `[library]` の `folders` に音声ファイルのフォルダを書きます(WAV / FLAC / MP3 / AIFF / OGG、サブフォルダも対象)
+
+   ```toml
+   [library]
+   folders = ["D:/Music/DJ"]
+   ```
+3. 起動してコンソールで `scan()`。見つかった曲が TRACKS に出て、裏で解析が進みます(LIBRARY の枠の下に
+   `analyzing 3/120` のように進捗が出ます)。解析はワーカープロセス(既定2つ)で行うので UI は止まりません
+4. 解析が済んだ曲(`✓`)から `snip(番号, ...)` で切り出せます
+
+TRACKS の記号: `·` 未解析 / `…` 解析中 / `✓` 済 / `✗` 失敗 / `?` ファイルが見つからない。
+解析結果・手動補正・設定の置き場所は [docs/decisions.md](docs/decisions.md) の D2 を参照。
+環境変数 `CLIDJ_HOME` を指定すると、それらを全部そのフォルダの下にまとめます。
+
+自動解析は外れる前提です。BPM やグリッドの位置、キーが違っていたら補正します(`overrides.json` に保存され、
+自動解析より優先されます):
+
+```python
+regrid(3, bpm=127.98)        # BPM を指定
+regrid(3, offset_ms=12)      # 拍0(グリッド)を 12ms 後ろへ。負の値で前へ。何度でも足し込める
+regrid(3, first_beat=0.382)  # 拍0の位置を秒で直接指定
+regrid(3, reset=True)        # BPM とグリッドの補正を消して自動解析に戻す
+setkey(3, "8A")              # キー(Camelot 表記)
 ```
 
 `--set` は起動時にそのファイルの中身をそのまま実行するだけです。**Transport は自動では
@@ -78,6 +107,10 @@ py -3.13 -m venv .venv
 | `queue()` | 予約中イベントをログに出す |
 | `cancel(3)` / `cancel()` | ID 3 のイベントを取り消す / 全取り消し |
 | `snips()` | 定義済みスニペット一覧 |
+| `tracks()` | ライブラリ一覧(番号・BPM・キー・解析状態)をログに出す |
+| `scan()` / `scan(retry=True)` | フォルダを再スキャンし、新しい曲(と、retry なら失敗した曲)を解析 |
+| `regrid(3, bpm=127.98, offset_ms=12)` | 曲のビートグリッドを補正(overrides に保存) |
+| `setkey(3, "8A")` | 曲のキーを補正(overrides に保存) |
 | `load_set("demo")` | `sets/demo.djs` を読み込んで実行 |
 | `clear()` / `help()` | ログのクリア / コマンド一覧表示 |
 

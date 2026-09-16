@@ -4,3 +4,8 @@ __pycache__/
 .pytest_cache/
 screenshot*.svg
 renders/
+
+# cli-dj keeps caches outside the repo (docs/decisions.md D2); these guard against stray copies
+/cache/
+/.clidj/
+*.npy

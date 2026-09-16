@@ -52,7 +52,7 @@ def resolve_track(library: list[Track], track: Track | int | str) -> Track:
         raise SnippetError(f"no track #{track} in library")
     if isinstance(track, str):
         for t in library:
-            if t.title.lower() == track.lower():
+            if t.title.lower() == track.lower() or t.track_id == track:
                 return t
         raise SnippetError(f"no track titled {track!r} in library")
     raise SnippetError("track must be a Track, an id, or a title")
@@ -83,6 +83,11 @@ def snip(
         raise SnippetError("snip() needs exactly one of cue= or bar=")
 
     resolved = resolve_track(library, track)
+    if not resolved.playable:
+        raise SnippetError(
+            f"#{resolved.id} {resolved.title} has no beat grid yet (status: {resolved.status}); run scan() "
+            "or set one with regrid()"
+        )
 
     if cue is not None:
         if cue not in resolved.cues:

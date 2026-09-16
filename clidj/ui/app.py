@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from rich.markup import escape
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -24,10 +25,12 @@ from textual.containers import Horizontal, Vertical
 from textual.css.query import NoMatches
 from textual.widgets import DataTable, Input, RichLog, Static, TabbedContent, TabPane
 
+from ..config import Config, Paths
 from ..interpreter import Interpreter
 from ..lanes import LANE_NAMES, Lane, check_warnings
-from ..library import DEMO_LIBRARY, SAMPLES_PER_BEAT, Track
+from ..library import SAMPLES_PER_BEAT, Track
 from ..scheduler import Scheduler
+from ..session import Session
 from ..snippets import BEATS_PER_BAR as SNIPPET_BEATS_PER_BAR
 from ..snippets import Snippet
 from ..transport import Transport
@@ -250,14 +253,29 @@ class LanesView(Static):
         return top, bottom
 
 
+TRACK_STATUS_GLYPHS = {"demo": " ", "new": "·", "analyzing": "…", "ready": "✓", "failed": "✗", "missing": "?"}
+
+
 class DJApp(App):
     CSS_PATH = "app.tcss"
     TITLE = "cli-dj"
 
-    def __init__(self, set_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        set_path: Path | None = None,
+        *,
+        demo: bool = False,
+        paths: Paths | None = None,
+        config: Config | None = None,
+        jobs=None,
+    ) -> None:
         super().__init__()
         self._set_path = set_path
-        self.library: list[Track] = DEMO_LIBRARY
+        self._pending_log: list[tuple[str, str]] = []
+        self.paths = paths or Paths.default()
+        self.config = config or Config.load(self.paths)
+        self.session = Session(self.paths, self.config, self._log, demo=demo, jobs=jobs)
+        self.library: list[Track] = self.session.tracks
         self.transport = Transport()
         self.lanes: dict[str, Lane] = {name: Lane(name) for name in LANE_NAMES}
         self.scheduler = Scheduler(self.transport, self._log)
@@ -269,8 +287,10 @@ class DJApp(App):
             self._log,
             SETS_DIR,
             on_clear=self._clear_log,
+            session=self.session,
         )
         self._last_tick = time.monotonic()
+        self._tracks_version = -1
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="root"):
@@ -300,16 +320,14 @@ class DJApp(App):
         tracks_table = self.query_one("#tracks-table", DataTable)
         tracks_table.cursor_type = "row"
         # Column widths + 2 cells of padding per column must fit the pane's
-        # inner width minus a vertical scrollbar (see LIBRARY_PANE_WIDTH).
+        # inner width minus a vertical scrollbar (see #library-pane in app.tcss).
         tracks_table.add_column("#", width=3)
-        tracks_table.add_column("Title", width=14)
-        tracks_table.add_column("Artist", width=10)
+        tracks_table.add_column("", width=1)  # analysis status glyph
+        tracks_table.add_column("Title", width=13)
+        tracks_table.add_column("Artist", width=8)
         tracks_table.add_column("BPM", width=5)
         tracks_table.add_column("Key", width=3)
         tracks_table.add_column("Time", width=5)
-        for t in self.library:
-            m, s = divmod(int(t.duration), 60)
-            tracks_table.add_row(str(t.id), t.title, t.artist, f"{t.bpm:.0f}", t.key, f"{m}:{s:02d}")
 
         snips_table = self.query_one("#snips-table", DataTable)
         snips_table.cursor_type = "row"
@@ -320,9 +338,15 @@ class DJApp(App):
         snips_table.add_column("Key", width=3)
         snips_table.add_column("Loop", width=5)
 
+        mode = "demo library" if self.session.demo else f"library: {len(self.library)} track(s)"
         self.query_one("#console-log", RichLog).write(
-            "[bold]cli-dj[/] — snippet-driven live coding, visual only. type help() and press Enter"
+            f"[bold]cli-dj[/] — snippet-driven live coding, visual only ({mode}). type help() and press Enter"
         )
+        for message, level in self._pending_log:
+            self._log(message, level)
+        self._pending_log.clear()
+        if not self.session.demo and not self.config.library_folders:
+            self._log(f"no library folders yet: add them to {self.paths.config_file}, then scan()", "warn")
 
         if self._set_path is not None:
             self._load_set_path(self._set_path)
@@ -330,6 +354,9 @@ class DJApp(App):
         self.set_interval(1 / 30, self._on_tick)
         self.query_one("#command-input", HistoryInput).focus()
         self._refresh_all()
+
+    def on_unmount(self) -> None:
+        self.session.close()
 
     def _load_set_path(self, path: Path) -> None:
         try:
@@ -344,6 +371,7 @@ class DJApp(App):
         now = time.monotonic()
         dt = now - self._last_tick
         self._last_tick = now
+        self.session.poll()
         self.scheduler.tick(dt)
         for lane in self.lanes.values():
             lane.update(self.transport)
@@ -355,8 +383,26 @@ class DJApp(App):
         except NoMatches:  # the interval timer can fire once more while the app shuts down
             return
         lanes_view.refresh_view()
+        self._refresh_tracks_table()
         self._refresh_snips_table()
         self._refresh_queue()
+
+    def _refresh_tracks_table(self) -> None:
+        pane = self.query_one("#library-pane")
+        pane.border_subtitle = self.session.activity or ""
+        version = self.session.library_version
+        if version == self._tracks_version:
+            return
+        self._tracks_version = version
+        table = self.query_one("#tracks-table", DataTable)
+        table.clear()
+        for t in self.library:
+            m, s = divmod(int(t.duration), 60)
+            bpm = f"{t.bpm:.1f}" if t.bpm > 0 else "--"
+            table.add_row(
+                str(t.id), TRACK_STATUS_GLYPHS.get(t.status, " "), t.title, t.artist, bpm, t.key or "--",
+                f"{m}:{s:02d}",
+            )
 
     def _refresh_snips_table(self) -> None:
         table = self.query_one("#snips-table", DataTable)
@@ -379,17 +425,24 @@ class DJApp(App):
             lines.append("(empty)")
         else:
             for event_id, beat, desc in items:
-                lines.append(f"#{event_id} @{self.transport.display_at(beat)} {desc}")
+                lines.append(escape(f"#{event_id} @{self.transport.display_at(beat)} {desc}"))
         view.update("\n".join(lines))
 
     def _log(self, message: str, level: str = "info") -> None:
+        if not self.is_mounted:
+            self._pending_log.append((message, level))
+            return
+        safe = escape(message)
         if level == "warn":
-            rendered = f"[yellow]{message}[/]"
+            rendered = f"[yellow]{safe}[/]"
         elif level == "error":
-            rendered = f"[red]{message}[/]"
+            rendered = f"[red]{safe}[/]"
         else:
-            rendered = message
-        self.query_one("#console-log", RichLog).write(rendered)
+            rendered = safe
+        try:
+            self.query_one("#console-log", RichLog).write(rendered)
+        except NoMatches:
+            self._pending_log.append((message, level))
 
     def _clear_log(self) -> None:
         self.query_one("#console-log", RichLog).clear()
@@ -401,17 +454,18 @@ class DJApp(App):
             return
         if isinstance(event.input, HistoryInput):
             event.input.remember(text)
-        self.query_one("#console-log", RichLog).write(f"[bold cyan]> {text}[/]")
+        self.query_one("#console-log", RichLog).write(f"[bold cyan]> {escape(text)}[/]")
         self.interp.run(text)
         self._refresh_all()
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="cli-dj: visual-only live-coding DJ TUI")
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(prog="python -m clidj", description="cli-dj: live-coding DJ TUI")
     parser.add_argument("--set", dest="set_path", default=None, help="path to a .djs set file to load at startup")
-    args = parser.parse_args()
+    parser.add_argument("--demo", action="store_true", help="use the built-in demo library instead of your music")
+    args = parser.parse_args(argv)
     set_path = Path(args.set_path) if args.set_path else None
-    DJApp(set_path=set_path).run()
+    DJApp(set_path=set_path, demo=args.demo).run()
 
 
 if __name__ == "__main__":
