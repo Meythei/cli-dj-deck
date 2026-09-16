@@ -128,10 +128,7 @@ def test_scan_analyses_new_tracks_and_snip_works_afterwards(tmp_path, audio_file
         assert track.lufs is not None
     assert any("analysis finished" in m for _, m in logs)
 
-    transport = Transport()
-    lanes = {n: Lane(n) for n in LANE_NAMES}
-    interp = Interpreter(transport, Scheduler(transport, lambda *a: None), lanes, session.tracks,
-                         lambda m, level="info": logs.append((level, m)), Path("."), session=session)
+    interp = Interpreter(session, Path("."), log=lambda m, level="info": logs.append((level, m)))
     interp.run("a = snip(1, bar=2, bars=4, loop=True)")
     assert isinstance(interp.env["a"], Snippet)
     assert interp.env["a"].start_beat == 4.0
@@ -145,9 +142,7 @@ def test_snip_on_an_unanalysed_track_is_a_clear_error(tmp_path, audio_files):
     lib = session.library
     lib.merge_scan(discover([src], {}))  # scanned, never analysed
     logs = []
-    transport = Transport()
-    interp = Interpreter(transport, Scheduler(transport, lambda *a: None), {n: Lane(n) for n in LANE_NAMES},
-                         session.tracks, lambda m, level="info": logs.append((level, m)), Path("."), session=session)
+    interp = Interpreter(session, Path("."), log=lambda m, level="info": logs.append((level, m)))
     interp.run("a = snip(1, bar=1, bars=4)")
     errors = [m for level, m in logs if level == "error"]
     assert errors and "scan()" in errors[0]

@@ -17,7 +17,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-from .lanes import Lane
 from .transport import EPSILON, Transport
 
 LogFn = Callable[[str, str], None]  # (message, level) where level in info/warn/error
@@ -40,17 +39,6 @@ class ScheduledEvent:
     recurring_bars: Optional[float] = None  # set only for every()'s repeating events
 
 
-@dataclass
-class Automation:
-    id: int
-    from_lane: Lane
-    to_lane: Lane
-    start_beat: float
-    end_beat: float
-    from_start_gain: float
-    description: str
-
-
 class Scheduler:
     # Safety valve: one poll never fires more than this many events. The rest
     # stay queued for the next poll, so the UI keeps drawing and can be used
@@ -61,13 +49,13 @@ class Scheduler:
         self.transport = transport
         self.log = log
         self.events: list[ScheduledEvent] = []
-        self.automations: list[Automation] = []
         self.firing_beat: Optional[float] = None
         self._next_id = 1
         self._recurring_active: dict[int, bool] = {}
-        self._lane_automation: dict[str, int] = {}  # lane name -> automation id targeting its gain
 
-    def _new_id(self) -> int:
+    def new_id(self) -> int:
+        """Ids for events and for things the session tracks alongside them
+        (crossfades), from one sequence so cancel(n) is unambiguous."""
         event_id = self._next_id
         self._next_id += 1
         return event_id
@@ -113,50 +101,19 @@ class Scheduler:
         if bars * self.transport.beats_per_bar < MIN_EVERY_BEATS - EPSILON:
             minimum = MIN_EVERY_BEATS / self.transport.beats_per_bar
             raise SchedulerError(f"every() needs an interval of at least {minimum:g} bars (1 beat)")
-        event_id = self._new_id()
+        event_id = self.new_id()
         self._recurring_active[event_id] = True
         target = self.transport.next_boundary_beats("bar")
         self.events.append(ScheduledEvent(event_id, target, action, description, recurring_bars=bars))
         return event_id
 
-    def start_automation(
-        self, from_lane: Lane, to_lane: Lane, bars: float, description: str, start_beat: Optional[float] = None
-    ) -> int:
-        """Linear crossfade: from_lane.gain current->0, to_lane.gain 0->1,
-        over `bars` bars from `start_beat` (default: the beat of the event
-        currently firing, else the transport position). Overriding an
-        in-flight automation on either lane logs a warning and replaces it."""
-        for lane in (from_lane, to_lane):
-            existing = self._lane_automation.get(lane.name)
-            if existing is not None:
-                self.log(f"{lane.name}: gain automation overridden by new xf", "warn")
-                self.automations = [a for a in self.automations if a.id != existing]
-                self._lane_automation.pop(lane.name, None)
-
-        if start_beat is None:
-            start_beat = self.firing_beat if self.firing_beat is not None else self.transport.position_beats
-        automation_id = self._new_id()
-        automation = Automation(
-            id=automation_id,
-            from_lane=from_lane,
-            to_lane=to_lane,
-            start_beat=start_beat,
-            end_beat=start_beat + bars * self.transport.beats_per_bar,
-            from_start_gain=from_lane.gain,
-            description=description,
-        )
-        to_lane.gain = 0.0
-        self.automations.append(automation)
-        self._lane_automation[from_lane.name] = automation_id
-        self._lane_automation[to_lane.name] = automation_id
-        return automation_id
-
     # ---- per-frame update ----------------------------------------------------
 
     def tick(self, dt_seconds: float) -> None:
+        """Advance a free-running Transport and fire what became due (used
+        when no engine drives the clock, e.g. in unit tests)."""
         _, now = self.transport.advance(dt_seconds)
         self.poll(now)
-        self._advance_automations(now)
 
     def poll(self, limit_beats: float) -> int:
         """Fire every queued event scheduled at or before `limit_beats`, in
@@ -203,25 +160,10 @@ class Scheduler:
         finally:
             self.firing_beat = previous
 
-    def _advance_automations(self, now: float) -> None:
-        finished = []
-        for automation in self.automations:
-            span = automation.end_beat - automation.start_beat
-            ratio = 1.0 if span <= 0 else max(0.0, min(1.0, (now - automation.start_beat) / span))
-            automation.from_lane.gain = automation.from_start_gain * (1 - ratio)
-            automation.to_lane.gain = ratio
-            if now >= automation.end_beat:
-                finished.append(automation)
-        for automation in finished:
-            automation.from_lane.stop()
-            self.automations.remove(automation)
-            self._lane_automation.pop(automation.from_lane.name, None)
-            self._lane_automation.pop(automation.to_lane.name, None)
-
     # ---- introspection ---------------------------------------------------
 
     def _enqueue(self, target_beats: float, action: Callable[[], None], description: str) -> int:
-        event_id = self._new_id()
+        event_id = self.new_id()
         self.events.append(ScheduledEvent(event_id, target_beats, action, description))
         return event_id
 
@@ -233,25 +175,15 @@ class Scheduler:
 
     def cancel(self, event_id: Optional[int] = None) -> str:
         if event_id is None:
-            count = len(self.events) + len(self.automations)
+            count = len(self.events)
             self.events.clear()
-            self.automations.clear()
             self._recurring_active.clear()
-            self._lane_automation.clear()
             return f"cancelled {count} event(s)"
 
-        found = (
-            any(e.id == event_id for e in self.events)
-            or event_id in self._recurring_active
-            or any(a.id == event_id for a in self.automations)
-        )
+        found = any(e.id == event_id for e in self.events) or event_id in self._recurring_active
         if not found:
             raise SchedulerError(f"no such event #{event_id}")
 
         self.events = [e for e in self.events if e.id != event_id]
-        self.automations = [a for a in self.automations if a.id != event_id]
         self._recurring_active.pop(event_id, None)
-        for lane_name, aid in list(self._lane_automation.items()):
-            if aid == event_id:
-                del self._lane_automation[lane_name]
         return f"cancelled #{event_id}"

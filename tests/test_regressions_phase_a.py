@@ -5,26 +5,31 @@ from pathlib import Path
 
 import pytest
 
+import tempfile
+
+from clidj.config import Config, Paths
 from clidj.interpreter import Interpreter
-from clidj.lanes import LANE_NAMES, Lane
-from clidj.library import DEMO_LIBRARY
+from clidj.lanes import Lane
 from clidj.scheduler import Scheduler
-from clidj.transport import Transport
+from clidj.session import Session
+from clidj.workers import InlineJobRunner
 
 SETS_DIR = Path(__file__).resolve().parents[1] / "sets"
 
 
 def make_interp(sets_dir: Path | None = None, bpm: float = 120.0):
+    """(interpreter, transport view, session, lane views, logs) on a visual-only
+    engine: the session drives time, so tests advance it with session.tick()."""
     logs: list[tuple[str, str]] = []
 
     def log(message: str, level: str = "info") -> None:
         logs.append((level, message))
 
-    transport = Transport(bpm=bpm, beats_per_bar=4)
-    scheduler = Scheduler(transport, log)
-    lanes = {name: Lane(name) for name in LANE_NAMES}
-    interp = Interpreter(transport, scheduler, lanes, DEMO_LIBRARY, log, sets_dir or Path("."))
-    return interp, transport, scheduler, lanes, logs
+    home = Path(tempfile.mkdtemp(prefix="clidj-test-"))
+    session = Session(Paths(home / "c", home / "d", home / "k"), Config(), log, demo=True,
+                      jobs=InlineJobRunner(), bpm=bpm)
+    interp = Interpreter(session, sets_dir or Path("."))
+    return interp, session.transport, session, session.lanes, logs
 
 
 def errors(logs):
@@ -35,35 +40,35 @@ def errors(logs):
 
 
 def test_demo_set_lanes_start_exactly_on_their_scheduled_bar_heads():
-    interp, transport, scheduler, lanes, logs = make_interp(sets_dir=SETS_DIR)
+    interp, transport, session, lanes, logs = make_interp(sets_dir=SETS_DIR)
     interp.run('load_set("demo")')
     interp.run("start()")
     # Tick like the UI does (30 fps) so every firing overshoots its boundary.
     for _ in range(int(40 * 60 / 128 * 4 * 30)):
-        scheduler.tick(1 / 30)
+        session.tick(1 / 30)
     assert lanes["L3"].started_at_beat == pytest.approx(64.0, abs=1e-9)
     assert lanes["L4"].started_at_beat == pytest.approx(128.0, abs=1e-9)
     assert lanes["L2"].started_at_beat == pytest.approx(32.0, abs=1e-9)
 
 
 def test_quantized_play_starts_on_the_boundary_not_the_tick_that_crossed_it():
-    interp, transport, scheduler, lanes, logs = make_interp()
+    interp, transport, session, lanes, logs = make_interp()
     interp.run("kick = snip(1, cue=1, bars=8, loop=True)")
     interp.run("start()")
-    scheduler.tick(0.3)  # 0.6 beats in
+    session.tick(0.3)  # 0.6 beats in
     interp.run("L1 << kick")
-    scheduler.tick(1.77)  # crosses beat 4 by 0.14 beats
+    session.tick(1.77)  # crosses beat 4 by 0.14 beats
     assert lanes["L1"].started_at_beat == pytest.approx(4.0, abs=1e-9)
 
 
 def test_xf_start_and_end_beats_come_from_the_scheduled_boundary():
-    interp, transport, scheduler, lanes, logs = make_interp()
+    interp, transport, session, lanes, logs = make_interp()
     interp.run("kick = snip(1, cue=1, bars=32, loop=True)")
     interp.run("L1 << kick")
     interp.run("start()")
     interp.run("at(3, xf(L1, L2, 2))")
-    scheduler.tick(8.0 * 60 / 120 + 0.021)
-    [automation] = scheduler.automations
+    session.tick(8.0 * 60 / 120 + 0.021)
+    [automation] = session.crossfades.values()
     assert automation.start_beat == pytest.approx(8.0, abs=1e-9)
     assert automation.end_beat == pytest.approx(16.0, abs=1e-9)
 
@@ -88,32 +93,32 @@ def test_explicit_name_wins_over_the_variable_name():
 
 
 def test_negative_after_is_an_error_and_never_queued():
-    interp, transport, scheduler, lanes, logs = make_interp()
+    interp, transport, session, lanes, logs = make_interp()
     interp.run("kick = snip(1, cue=1, bars=8, loop=True)")
     interp.run("start()")
     interp.run("after(-4, L1 << kick)")
     assert errors(logs)
-    assert scheduler.pending() == []
+    assert session.scheduler.pending() == []
 
 
 def test_at_bar_below_one_is_an_error():
-    interp, transport, scheduler, lanes, logs = make_interp()
+    interp, transport, session, lanes, logs = make_interp()
     interp.run("kick = snip(1, cue=1, bars=8, loop=True)")
     interp.run("at(0, L1 << kick)")
     assert errors(logs)
-    assert scheduler.pending() == []
+    assert session.scheduler.pending() == []
 
 
 # ---- 5. at(1, ...) written before start() ---------------------------------
 
 
 def test_at_bar_one_before_start_fires_the_moment_transport_starts():
-    interp, transport, scheduler, lanes, logs = make_interp()
+    interp, transport, session, lanes, logs = make_interp()
     interp.run("kick = snip(1, cue=1, bars=8, loop=True)")
     interp.run("at(1, L1 << kick)")
     assert not any(level == "warn" for level, _ in logs)
     interp.run("start()")
-    scheduler.tick(1 / 30)
+    session.tick(1 / 30)
     assert lanes["L1"].snippet is interp.env["kick"]
     assert lanes["L1"].started_at_beat == pytest.approx(0.0, abs=1e-9)
 
@@ -122,17 +127,17 @@ def test_at_bar_one_before_start_fires_the_moment_transport_starts():
 
 
 def test_every_below_one_beat_is_rejected():
-    interp, transport, scheduler, lanes, logs = make_interp()
+    interp, transport, session, lanes, logs = make_interp()
     interp.run("every(0.001, queue())")
     assert errors(logs)
-    assert scheduler.pending() == []
+    assert session.scheduler.pending() == []
 
 
 def test_one_tick_fires_a_bounded_number_of_events():
-    interp, transport, scheduler, lanes, logs = make_interp()
+    interp, transport, session, lanes, logs = make_interp()
     interp.run("start()")
     interp.run("every(0.25, queue())")  # one firing per beat
-    scheduler.tick(100_000.0)  # a pathological stall: 200k beats in one tick
+    session.tick(100_000.0)  # a pathological stall: 200k beats in one tick
     fired = sum(1 for level, message in logs if message.startswith("queue:") or message.startswith("#"))
     assert 0 < fired <= Scheduler.MAX_FIRES_PER_POLL
     assert any("fire" in message for message in errors(logs))
@@ -143,7 +148,7 @@ def test_one_tick_fires_a_bounded_number_of_events():
 
 def test_self_loading_set_stops_at_the_nesting_limit(tmp_path: Path):
     (tmp_path / "loop.djs").write_text('load_set("loop")\n', encoding="utf-8")
-    interp, transport, scheduler, lanes, logs = make_interp(sets_dir=tmp_path)
+    interp, transport, session, lanes, logs = make_interp(sets_dir=tmp_path)
     interp.run('load_set("loop")')
     errs = errors(logs)
     assert len(errs) == 1
@@ -156,7 +161,7 @@ def test_self_loading_set_stops_at_the_nesting_limit(tmp_path: Path):
 
 
 def test_play_log_comes_before_now_playing_when_run_immediately():
-    interp, transport, scheduler, lanes, logs = make_interp()
+    interp, transport, session, lanes, logs = make_interp()
     interp.run("kick = snip(1, cue=1, bars=8, loop=True)")
     logs.clear()
     interp.run("L1 << kick")
@@ -168,12 +173,12 @@ def test_play_log_comes_before_now_playing_when_run_immediately():
 
 
 def test_fired_reservation_is_not_labelled_as_now():
-    interp, transport, scheduler, lanes, logs = make_interp()
+    interp, transport, session, lanes, logs = make_interp()
     interp.run("kick = snip(1, cue=1, bars=8, loop=True)")
     interp.run("start()")
     interp.run("at(2, L1 << kick)")
     logs.clear()
-    scheduler.tick(4 * 60 / 120 + 0.01)
+    session.tick(4 * 60 / 120 + 0.01)
     fired = [message for _, message in logs if "L1 << kick" in message]
     assert fired, logs
     assert all("(now)" not in message for message in fired)
@@ -185,10 +190,10 @@ def test_fired_reservation_is_not_labelled_as_now():
     [("at(9, L1 << kick)", 9), ("after(4, L1 << kick)", 6), ("every(8, L1 << kick)", 2)],
 )
 def test_reservations_log_the_bar_they_were_queued_for(command, bar):
-    interp, transport, scheduler, lanes, logs = make_interp()
+    interp, transport, session, lanes, logs = make_interp()
     interp.run("kick = snip(1, cue=1, bars=8, loop=True)")
     interp.run("start()")
-    scheduler.tick(0.5)  # inside bar 1
+    session.tick(0.5)  # inside bar 1
     logs.clear()
     interp.run(command)
     assert any(f"bar {bar}" in message for level, message in logs if level == "info"), logs

@@ -50,13 +50,11 @@ def make(tmp_path, click_source, jobs, bpm=124.0):
     logs: list[tuple[str, str]] = []
     log = lambda message, level="info": logs.append((level, message))  # noqa: E731
     paths = Paths(tmp_path / "config", tmp_path / "data", tmp_path / "cache")
-    session = Session(paths, Config(), log, demo=True, jobs=jobs, prepare=True)
+    session = Session(paths, Config(), log, demo=True, jobs=jobs, prepare=True, bpm=bpm)
     session.tracks[:] = [
         Track(1, "Clicks", "Test", 124.0, "8A", 60.0, first_beat=0.37, path=click_source, track_id="clicks", status="ready")
     ]
-    session.transport.bpm = bpm
-    interp = Interpreter(session.transport, session.scheduler, session.lanes, session.tracks, log, Path("."),
-                         session=session)
+    interp = Interpreter(session, Path("."), log=log)
     return session, interp, logs
 
 
@@ -247,8 +245,7 @@ def test_demo_snippet_synthesises_its_track_then_renders(tmp_path):
                       jobs=InlineJobRunner(), prepare=True)
     track = session.tracks[0]
     track.duration = 40.0  # keep the synthesis short for the test
-    interp = Interpreter(session.transport, session.scheduler, session.lanes, session.tracks,
-                         lambda m, level="info": logs.append((level, m)), Path("."), session=session)
+    interp = Interpreter(session, Path("."), log=lambda m, level="info": logs.append((level, m)))
     fake_waveform = list(track.waveform)
     interp.run("kick = snip(1, bar=1, bars=2, loop=True)")
     assert session.prep_state(interp.env["kick"]) == prep_states.PENDING

@@ -418,12 +418,15 @@ class Engine:
         return min(future) if future else math.inf
 
     def _render(self, out: Optional[np.ndarray], n: int) -> None:
-        arange = self._arange if n <= MAX_BLOCK else np.arange(n + 1, dtype=np.float64)
-        beats = None
-        if self.running:
-            seg = self.tempo.segment_for_sample(self.transport_sample)
-            spb = seg.samples_per_beat(self.samplerate)
-            beats = seg.beat + (self.transport_sample + arange[:n] - seg.sample) / spb
+        beats = arange = None
+        if out is not None:
+            # Per-sample arrays only when producing audio: a visual-mode span
+            # can be arbitrarily long (a stalled UI tick) and needs none.
+            arange = self._arange if n <= MAX_BLOCK else np.arange(n + 1, dtype=np.float64)
+            if self.running:
+                seg = self.tempo.segment_for_sample(self.transport_sample)
+                spb = seg.samples_per_beat(self.samplerate)
+                beats = seg.beat + (self.transport_sample + arange[:n] - seg.sample) / spb
         end_sample = self.transport_sample + n
         end_beat = self.tempo.sample_to_beat(end_sample) if self.running else self.position_beats
 
@@ -517,6 +520,11 @@ class Engine:
                                          start_value, command.end_value, command.stop_lane_at_end)
             lane.current_gain = start_value if command.param == "gain" else lane.current_gain
         elif isinstance(command, cmd.CancelAutomation):
+            self._pending = [
+                entry for entry in self._pending
+                if not (isinstance(entry[2], cmd.Automate)
+                        and command.automation_id in (None, entry[2].automation_id))
+            ]
             for lane in self.lanes:
                 if lane.automation and command.automation_id in (None, lane.automation.automation_id):
                     value = lane.automation.value_at(position)

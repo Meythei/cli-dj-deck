@@ -127,29 +127,26 @@ class Interpreter:
 
     def __init__(
         self,
-        transport: Transport,
-        scheduler: Scheduler,
-        lanes: dict[str, Lane],
-        library: list[Track],
-        log: LogFn,
+        session,
         sets_dir: Path,
+        *,
+        log: Optional[LogFn] = None,
         on_clear: Callable[[], None] = lambda: None,
-        session=None,
     ) -> None:
-        self.transport = transport
-        self.scheduler = scheduler
-        self.lanes = lanes
-        self.library = library
-        self.log = log
+        self.session = session
+        self.transport: Transport = session.transport
+        self.scheduler: Scheduler = session.scheduler
+        self.lanes: dict[str, Lane] = session.lanes
+        self.library: list[Track] = session.tracks
+        self.log = log or session.log
         self.sets_dir = sets_dir
         self.on_clear = on_clear
-        self.session = session
         self.quant_mode = "bar"
         self._in_scheduled_context = False
         self._snip_name_hint: Optional[str] = None
         self._set_depth = 0
 
-        self.env: dict[str, object] = dict(lanes)
+        self.env: dict[str, object] = dict(self.lanes)
         self.functions: dict[str, Callable] = self._build_functions()
         self.reserved_names = set(self.env) | set(self.functions) | SPECIAL_FORMS
         self.method_whitelist: dict[type, dict[str, Callable]] = {
@@ -292,12 +289,13 @@ class Interpreter:
 
     # ---- quantized dispatch, shared by lane play/stop and xf -----------------
 
-    def _quantized(self, description: str, action: Callable[[float], None]) -> None:
-        """Run `action(start_beat)` at the right beat, logging *before* it runs
-        so the command always appears ahead of whatever the action logs.
+    def _quantized(self, description: str, action: Callable[[Optional[float]], None]) -> None:
+        """Run `action(beat)` at the right beat, logging *before* it runs so
+        the command always appears ahead of whatever the action logs. `beat`
+        is None for "immediately" (the engine's next block).
 
-        - inside a fired at/after/every: at the event's scheduled beat, now
-        - inside now(...), or with quant("none"): at the current position, now
+        - inside a fired at/after/every: at the event's scheduled beat
+        - inside now(...), or with quant("none"): immediately
         - transport stopped: immediately (no boundary is coming in real time)
         - otherwise: queued for the next boundary of the quantize mode
         """
@@ -305,18 +303,18 @@ class Interpreter:
             fired = self.scheduler.firing_beat
             if fired is None:
                 self.log(f"{description} (now)", "info")
-                action(self.transport.position_beats)
+                action(None)
             else:
                 self.log(f"[{self.transport.display_at(fired)}] {description}", "info")
                 action(fired)
             return
         if not self.transport.running:
             self.log(f"{description} (immediate)", "info")
-            action(self.transport.position_beats)
+            action(None)
             return
         if self.quant_mode == "none":
             self.log(f"{description} (now)", "info")
-            action(self.transport.position_beats)
+            action(None)
             return
 
         def fire() -> None:
@@ -335,42 +333,46 @@ class Interpreter:
             raise CommandError(f"{lane.name} can only play a snippet (got {type(snippet).__name__})")
         description = f"{lane.name} << {snippet.name}"
 
-        def action(start_beat: float) -> None:
-            if self.session is not None and not self.session.ready_to_play(snippet):
+        def action(beat: Optional[float]) -> None:
+            if not self.session.ready_to_play(snippet):
                 # Never start silently: wait for the render, then re-issue the
                 # play so it lands on the first boundary after it's ready.
                 self.session.hold(snippet, description, lambda: self._lane_play(lane, snippet))
                 return
-            lane.start_snippet(snippet, start_beat)
+            planned = Lane(lane.name, snippet=snippet)
             others = [other for name, other in self.lanes.items() if name != lane.name]
-            for message in check_warnings(lane, others, self.transport.bpm):
+            for message in check_warnings(planned, others, self.transport.bpm):
                 self.log(message, "warn")
+            self.session.play(lane, snippet, beat)
             self.log(f"{lane.name} now playing {snippet.name}", "info")
 
         self._quantized(description, action)
 
     def _lane_stop(self, lane: Lane) -> None:
-        self._quantized(f"{lane.name}.stop()", lambda _beat: lane.stop())
+        self._quantized(f"{lane.name}.stop()", lambda beat: self.session.stop_lane(lane, beat))
+
+    @staticmethod
+    def _unit(value, what: str) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise CommandError(f"{what} must be a number between 0 and 1")
+        return max(0.0, min(1.0, float(value)))
 
     def _lane_gain(self, lane: Lane, value) -> None:
-        lane.gain = max(0.0, min(1.0, float(value)))
+        self.session.set_param(lane, "gain", self._unit(value, "gain"))
         self.log(f"{lane.name}.gain -> {lane.gain:.2f}", "info")
 
     def _lane_mute(self, lane: Lane) -> None:
-        lane.muted = True
+        self.session.set_param(lane, "mute", 1.0)
         self.log(f"{lane.name} muted", "info")
 
     def _lane_unmute(self, lane: Lane) -> None:
-        lane.muted = False
+        self.session.set_param(lane, "mute", 0.0)
         self.log(f"{lane.name} unmuted", "info")
 
     def _lane_eq(self, lane: Lane, lo=None, mid=None, hi=None) -> None:
-        if lo is not None:
-            lane.lo = float(lo)
-        if mid is not None:
-            lane.mid = float(mid)
-        if hi is not None:
-            lane.hi = float(hi)
+        for band, value in (("lo", lo), ("mid", mid), ("hi", hi)):
+            if value is not None:
+                self.session.set_param(lane, band, self._unit(value, band))
         self.log(f"{lane.name}.eq(lo={lane.lo:.2f}, mid={lane.mid:.2f}, hi={lane.hi:.2f})", "info")
 
     # ---- global commands ---------------------------------------------------
@@ -397,36 +399,22 @@ class Interpreter:
         }
 
     def _cmd_start(self) -> None:
-        self.transport.start()
         self.log("transport running", "info")
-        # Anything reserved exactly at the position we're starting from (e.g.
-        # at(1, ...) typed before start()) belongs to this very moment.
-        self.scheduler.poll(self.transport.position_beats)
+        self.session.start()
 
     def _cmd_stop(self) -> None:
-        self.transport.stop()
+        self.session.stop()
         self.log("transport stopped", "info")
 
     def _cmd_bpm(self, value) -> None:
-        value = float(value)
-        if value <= 0:
-            raise CommandError("bpm must be positive")
-        if self.session is not None:
-            self.session.request_bpm(value, in_scheduled_context=self._in_scheduled_context)
-            return
-        if self._in_scheduled_context or not self.transport.running:
-            self.transport.bpm = value
-            self.log(f"bpm -> {value:.1f}", "info")
-            return
+        from .session import SessionError
 
-        target = self.transport.next_boundary_beats("bar")
-
-        def action() -> None:
-            self.transport.bpm = value
-            self.log(f"bpm -> {value:.1f}", "info")
-
-        self.scheduler.schedule_at(target, action, f"bpm({value:g})")
-        self.log(f"bpm({value:g}) scheduled for bar {self.transport.bar_at(target)}", "info")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise CommandError("bpm() needs a number")
+        try:
+            self.session.request_bpm(float(value), in_scheduled_context=self._in_scheduled_context)
+        except SessionError as exc:
+            raise CommandError(str(exc)) from None
 
     def _cmd_quant(self, mode) -> None:
         if mode not in ("beat", "bar", "phrase", "none"):
@@ -445,8 +433,7 @@ class Interpreter:
             )
         except snippets.SnippetError as exc:
             raise CommandError(str(exc)) from None
-        if self.session is not None:
-            self.session.register_snippet(snippet)
+        self.session.register_snippet(snippet)
         self.log(
             f"{snippet.name} = {snippet.track.title} "
             f"[{snippet.start_beat:g}+{snippet.length_beats:g} beats] role={snippet.role}",
@@ -459,8 +446,12 @@ class Interpreter:
             raise CommandError("xf(from_lane, to_lane, bars=...) needs two lanes")
         description = f"xf({from_lane.name}, {to_lane.name}, {bars:g})"
 
-        def action(start_beat: float) -> None:
-            self.scheduler.start_automation(from_lane, to_lane, float(bars), description, start_beat=start_beat)
+        if isinstance(bars, bool) or not isinstance(bars, (int, float)) or bars < 0:
+            raise CommandError("xf() needs a non-negative number of bars")
+
+        def action(beat: Optional[float]) -> None:
+            start = self.session.immediate_beat() if beat is None else beat
+            self.session.crossfade(from_lane, to_lane, start, float(bars), description)
             self.log(f"{description} started", "info")
 
         self._quantized(description, action)
@@ -474,9 +465,11 @@ class Interpreter:
             self.log(f"#{event_id} @{self.transport.display_at(beat)} {desc}", "info")
 
     def _cmd_cancel(self, event_id=None) -> None:
+        from .session import SessionError
+
         try:
-            message = self.scheduler.cancel(int(event_id) if event_id is not None else None)
-        except SchedulerError as exc:
+            message = self.session.cancel(int(event_id) if event_id is not None else None)
+        except SessionError as exc:
             raise CommandError(str(exc)) from None
         self.log(message, "info")
 
@@ -494,8 +487,6 @@ class Interpreter:
             )
 
     def _require_session(self, command: str):
-        if self.session is None:
-            raise CommandError(f"{command}() needs a library session")
         return self.session
 
     def _cmd_prep(self) -> None:

@@ -280,16 +280,7 @@ class DJApp(App):
         self.transport = self.session.transport
         self.lanes: dict[str, Lane] = self.session.lanes
         self.scheduler = self.session.scheduler
-        self.interp = Interpreter(
-            self.transport,
-            self.scheduler,
-            self.lanes,
-            self.library,
-            self._log,
-            SETS_DIR,
-            on_clear=self._clear_log,
-            session=self.session,
-        )
+        self.interp = Interpreter(self.session, SETS_DIR, log=self._log, on_clear=self._clear_log)
         self._last_tick = time.monotonic()
         self._tracks_version = -1
         self._snips_signature: tuple = ()
