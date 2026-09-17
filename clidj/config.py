@@ -16,10 +16,15 @@ from typing import Optional, Union
 APP_NAME = "cli-dj"
 
 CONFIG_TEMPLATE = """\
-# cli-dj configuration. Paths may use forward slashes on Windows.
+# cli-dj configuration.
+#
+# Windows paths: write them with forward slashes in double quotes,
+# "D:/Music/DJ", or keep the backslashes inside single quotes, 'D:\\Music\\DJ'.
+# ("D:\\Music" does not work: inside double quotes a backslash starts an escape.)
 
 [library]
-# Folders scanned by scan(); subfolders are included.
+# Folders scanned by scan(); subfolders are included. Example:
+# folders = ["D:/Music/DJ", 'E:\\Tracks']
 folders = []
 # Detected tempi are folded by octaves into [bpm_min, bpm_max).
 bpm_min = 88.0
@@ -50,6 +55,10 @@ def install_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parents[1]
+
+
+class ConfigError(Exception):
+    """config.toml exists but can't be used; the message says how to fix it."""
 
 
 @dataclass(frozen=True)
@@ -129,8 +138,21 @@ class Config:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(CONFIG_TEMPLATE, encoding="utf-8")
             return cls()
-        with path.open("rb") as f:
-            return cls.from_dict(tomllib.load(f))
+        try:
+            with path.open("rb") as f:
+                data = tomllib.load(f)
+        except tomllib.TOMLDecodeError as exc:
+            message = f"{path} could not be read: {exc}"
+            if "\\" in str(exc):
+                message += (
+                    "\n  Windows paths in double quotes need forward slashes: \"D:/Music/DJ\"."
+                    "\n  Or keep the backslashes and use single quotes: 'D:\\Music\\DJ'."
+                )
+            raise ConfigError(message) from None
+        try:
+            return cls.from_dict(data)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"{path} has an invalid value: {exc}") from None
 
     @classmethod
     def from_dict(cls, data: dict) -> "Config":

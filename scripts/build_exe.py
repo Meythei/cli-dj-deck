@@ -33,10 +33,12 @@ def main() -> int:
     name = f"cli-dj-{__version__}-windows-x64"
     release = ROOT / "release"
     target = release / name
-    if target.exists():
-        shutil.rmtree(target)
-    release.mkdir(exist_ok=True)
-    shutil.copytree(app_dir, target)
+    target.mkdir(parents=True, exist_ok=True)
+    # Empty the folder rather than deleting it: a terminal may have it open as
+    # its current directory, and Windows won't remove a directory in use.
+    for child in target.iterdir():
+        shutil.rmtree(child) if child.is_dir() else child.unlink()
+    shutil.copytree(app_dir, target, dirs_exist_ok=True)
     archive = shutil.make_archive(str(release / name), "zip", root_dir=release, base_dir=name)
 
     version = subprocess.run([str(target / "cli-dj.exe"), "--version"], capture_output=True, text=True, timeout=120)

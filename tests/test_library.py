@@ -281,3 +281,34 @@ def test_crashed_worker_marks_tracks_failed_and_scan_retry_recovers(tmp_path, au
     healthy.scan(retry=True)
     healthy.poll()
     assert [t.status for t in healthy.tracks] == ["ready"] * 3
+
+
+def test_windows_path_with_backslashes_in_double_quotes_gives_a_readable_error(tmp_path, capsys):
+    from clidj.config import ConfigError
+    from clidj.ui.app import main as app_main
+
+    paths = Paths(tmp_path / "config", tmp_path / "data", tmp_path / "cache")
+    paths.config_dir.mkdir(parents=True)
+    paths.config_file.write_text('[library]\nfolders = ["D:\\DJ"]\n', encoding="utf-8")
+    with pytest.raises(ConfigError) as caught:
+        Config.load(paths)
+    assert "config.toml" in str(caught.value) and "forward slashes" in str(caught.value)
+
+    # the literal-string form keeps the backslashes and works
+    paths.config_file.write_text("[library]\nfolders = ['D:\\DJ']\n", encoding="utf-8")
+    assert Config.load(paths).library_folders == [Path("D:\\DJ")]
+
+    # the app exits with a message instead of a traceback
+    paths.config_file.write_text('[library]\nfolders = ["D:\\DJ"]\n', encoding="utf-8")
+    import os
+    os.environ["CLIDJ_HOME"] = str(tmp_path)
+    (tmp_path / "config").mkdir(exist_ok=True)
+    assert app_main([]) == 2
+    assert "forward slashes" in capsys.readouterr().err
+
+
+def test_config_template_parses():
+    import tomllib
+    from clidj.config import CONFIG_TEMPLATE
+
+    assert tomllib.loads(CONFIG_TEMPLATE)["library"]["folders"] == []

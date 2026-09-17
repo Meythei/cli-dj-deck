@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import sys
 import math
 import time
 from dataclasses import dataclass
@@ -27,7 +28,7 @@ from textual.containers import Horizontal, Vertical
 from textual.css.query import NoMatches
 from textual.widgets import DataTable, Input, RichLog, Static, TabbedContent, TabPane
 
-from ..config import Config, Paths, install_dir
+from ..config import Config, ConfigError, Paths, install_dir
 from ..interpreter import Interpreter
 from ..lanes import LANE_NAMES, Lane, check_warnings
 from ..library import SAMPLES_PER_BEAT, Track
@@ -594,7 +595,7 @@ class DJApp(App):
         self._refresh_all()
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m clidj", description="cli-dj: live-coding DJ TUI")
     parser.add_argument("--set", dest="set_path", default=None, help="path to a .djs set file to load at startup")
     parser.add_argument("--demo", action="store_true", help="use the built-in demo library instead of your music")
@@ -611,10 +612,16 @@ def main(argv: list[str] | None = None) -> None:
             marker = "*" if dev.is_default else " "
             print(f"{marker} {dev.index:>3}  {dev.hostapi:<22} {dev.channels}ch {dev.default_samplerate:>7.0f} Hz  {dev.name}")
         print("(* = default output of its host API; pass the number or part of the name to --device)")
-        return
+        return 0
     set_path = Path(args.set_path) if args.set_path else None
-    DJApp(set_path=set_path, demo=args.demo, audio=not args.no_audio,
-          backend="null" if args.null_audio else "sounddevice", device=args.device).run()
+    try:
+        app = DJApp(set_path=set_path, demo=args.demo, audio=not args.no_audio,
+                    backend="null" if args.null_audio else "sounddevice", device=args.device)
+    except ConfigError as exc:
+        print(f"cli-dj: {exc}", file=sys.stderr)
+        return 2
+    app.run()
+    return 0
 
 
 if __name__ == "__main__":

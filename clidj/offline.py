@@ -30,7 +30,7 @@ from typing import Callable, Optional
 
 import numpy as np
 
-from .config import Config, Paths
+from .config import Config, ConfigError, Paths
 from .engine.client import LocalEngineClient
 from .engine.core import Engine, EngineStats
 from .interpreter import Interpreter
@@ -218,7 +218,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         report = render_set_file(args.set_path, args.bars, output, demo=args.demo, script_text=script_text,
                                  log=echo, autostart=not args.no_start)
-    except (OSError, ScriptError) as exc:
+    except (OSError, ScriptError, ConfigError) as exc:
         print(f"render failed: {exc}", file=sys.stderr)
         return 1
     stats = report.stats

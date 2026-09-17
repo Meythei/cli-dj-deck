@@ -22,5 +22,4 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
     from .ui.app import main as app_main
 
-    app_main(argv)
-    return 0
+    return app_main(argv) or 0
