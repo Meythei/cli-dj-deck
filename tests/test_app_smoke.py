@@ -105,3 +105,36 @@ async def test_snips_table_shows_preparation_state(tmp_path):
         assert table.row_count == 1
         glyph, name, *_ = table.get_row_at(0)
         assert (glyph, name) == ("✓", "kick")
+
+
+async def test_app_with_a_realtime_engine_process_plays_and_shuts_it_down(tmp_path):
+    from clidj.config import Config, Paths
+    from clidj.workers import InlineJobRunner
+
+    paths = Paths(tmp_path / "config", tmp_path / "data", tmp_path / "cache")
+    app = DJApp(demo=True, audio=True, backend="null", paths=paths, config=Config(), jobs=InlineJobRunner())
+    client = app.session.engine
+    assert client.realtime and client.alive
+    async with app.run_test(size=(140, 44)) as pilot:
+        await pilot.pause()
+        input_widget = app.query_one("#command-input")
+        input_widget.value = "start()"
+        await pilot.press("enter")
+        await asyncio.sleep(0.6)
+        await pilot.pause()
+        assert app.transport.running
+        assert app.transport.position_beats > 0.5
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+    assert not client.alive
+    assert not client._process.is_alive()
+
+
+async def test_quit_command_exits_the_app():
+    app = DJApp(demo=True)
+    async with app.run_test(size=(140, 44)) as pilot:
+        await pilot.pause()
+        app.query_one("#command-input").value = "quit()"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app._exit

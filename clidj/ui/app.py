@@ -11,12 +11,14 @@ BPM -- is a visual simulation.
 from __future__ import annotations
 
 import argparse
+import gc
 import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 from rich.markup import escape
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -145,22 +147,44 @@ def _bar_head_columns(axis: WaveAxis, position: float, beats_per_bar: int) -> di
     return heads
 
 
-def _column_amplitude(snippet: Snippet, local_lo: float, local_hi: float) -> Optional[float]:
-    """Peak waveform amplitude over [local_lo, local_hi) beats of the
-    snippet, or None where a non-looping snippet has nothing to show."""
-    length = snippet.length_beats
-    first = math.floor(local_lo * SAMPLES_PER_BEAT)
-    last = max(first + 1, math.floor(local_hi * SAMPLES_PER_BEAT))
-    peak: Optional[float] = None
-    for index in range(first, last):
-        local = index / SAMPLES_PER_BEAT
-        if snippet.loop:
-            local %= length
-        elif not 0.0 <= local < length:
-            continue
-        amp = snippet.track.amplitude_at_beat(snippet.start_beat + local)
-        peak = amp if peak is None else max(peak, amp)
-    return peak
+def _column_peaks(snippet: Snippet, waveform: np.ndarray, local_now: float, axis: "WaveAxis") -> np.ndarray:
+    """Peak waveform amplitude per waveform column: the max over the column's
+    [beat - 1/8, beat + 1/8) range of the snippet, NaN where a non-looping
+    snippet has nothing to show. Vectorised: this runs for every lane on
+    every frame."""
+    cols = np.arange(axis.left, axis.left + axis.width)
+    local = local_now + (cols - axis.center) / QUARTER_COLS_PER_BEAT
+    half = 0.5 / QUARTER_COLS_PER_BEAT
+    first = np.floor((local - half) * SAMPLES_PER_BEAT).astype(np.int64)
+    last = np.maximum(first + 1, np.floor((local + half) * SAMPLES_PER_BEAT).astype(np.int64))
+    span = int((last - first).max())
+    index = first[:, None] + np.arange(span)[None, :]
+    covered = index < last[:, None]
+    sample_local = index / SAMPLES_PER_BEAT
+    if snippet.loop:
+        sample_local = np.mod(sample_local, snippet.length_beats)
+        valid = covered
+    else:
+        valid = covered & (sample_local >= 0.0) & (sample_local < snippet.length_beats)
+    if len(waveform) == 0:
+        amps = np.zeros(index.shape)
+    else:
+        track_index = np.clip(((snippet.start_beat + sample_local) * SAMPLES_PER_BEAT).astype(np.int64),
+                              0, len(waveform) - 1)
+        amps = waveform[track_index]
+    peaks = np.where(valid, amps, -np.inf).max(axis=1)
+    peaks[np.isneginf(peaks)] = np.nan
+    return peaks
+
+
+def _append_runs(text: Text, chars: list[str], styles: list[str]) -> None:
+    """Append characters grouped into runs of equal style (one span per run
+    instead of per cell keeps Rich fast)."""
+    start = 0
+    for i in range(1, len(chars) + 1):
+        if i == len(chars) or styles[i] != styles[start]:
+            text.append("".join(chars[start:i]), style=styles[start] or None)
+            start = i
 
 
 class LanesView(Static):
@@ -173,6 +197,15 @@ class LanesView(Static):
         self.transport = transport
         self.lanes = lanes
         self._quant_getter = quant_getter
+        self._waveforms: dict[int, tuple[list, np.ndarray]] = {}
+
+    def _waveform_array(self, track: Track) -> np.ndarray:
+        track.amplitude_at_beat(0.0)  # loads a lazily computed waveform
+        cached = self._waveforms.get(id(track))
+        if cached is None or cached[0] is not track.waveform:
+            cached = (track.waveform, np.asarray(track.waveform, dtype=np.float64))
+            self._waveforms[id(track)] = cached
+        return cached[1]
 
     def refresh_view(self) -> None:
         self.update(self.build_text(max(self.content_size.width, MIN_WIDTH)))
@@ -230,25 +263,28 @@ class LanesView(Static):
         bottom = Text(" " * axis.left)
         snippet = lane.snippet
         local_now = None if snippet is None else lane.local_beat(self.transport)
-        half_col = 0.5 / QUARTER_COLS_PER_BEAT
+        columns = axis.columns()
+        tints = [" on grey15" if heads.get(col) == "bar" else "" for col in columns]
 
-        for col in axis.columns():
-            tint = {"bar": " on grey15", "beat": ""}.get(heads.get(col, ""), "")
-            if snippet is None or local_now is None:
-                top.append(" ", style=f"grey37{tint}" if tint else "")
-                bottom.append(" ", style=f"grey37{tint}" if tint else "")
-                continue
-            local = local_now + axis.offset_beats(col)
-            amp = _column_amplitude(snippet, local - half_col, local + half_col)
-            base = f"bold {accent}" if col < axis.center else "grey50"
-            style = base + tint
-            if amp is None:
-                top.append(" ", style=style)
-                bottom.append(" ", style=style)
-                continue
-            levels = len(BAR_CHARS) - 1
-            top.append(BAR_CHARS[round(max(0.0, min(1.0, amp * 2 - 1)) * levels)], style=style)
-            bottom.append(BAR_CHARS[round(max(0.0, min(1.0, amp * 2)) * levels)], style=style)
+        if snippet is None or local_now is None:
+            styles = [f"grey37{tint}" if tint else "" for tint in tints]
+            blank = [" "] * len(columns)
+            _append_runs(top, blank, styles)
+            _append_runs(bottom, blank, styles)
+            return top, bottom
+
+        peaks = _column_peaks(snippet, self._waveform_array(snippet.track), local_now, axis)
+        levels = len(BAR_CHARS) - 1
+        present = ~np.isnan(peaks)
+        filled = np.nan_to_num(peaks)
+        top_levels = np.rint(np.clip(filled * 2 - 1, 0.0, 1.0) * levels).astype(int)
+        bottom_levels = np.rint(np.clip(filled * 2, 0.0, 1.0) * levels).astype(int)
+        top_chars = [BAR_CHARS[level] if ok else " " for level, ok in zip(top_levels, present)]
+        bottom_chars = [BAR_CHARS[level] if ok else " " for level, ok in zip(bottom_levels, present)]
+        past, future = f"bold {accent}", "grey50"
+        styles = [(past if col < axis.center else future) + tint for col, tint in zip(columns, tints)]
+        _append_runs(top, top_chars, styles)
+        _append_runs(bottom, bottom_chars, styles)
         return top, bottom
 
 
@@ -259,6 +295,9 @@ PREP_GLYPHS = {"none": "·", "pending": "…", "ready": "✓", "failed": "✗"}
 class DJApp(App):
     CSS_PATH = "app.tcss"
     TITLE = "cli-dj"
+    # Ctrl+C quits (and so shuts the engine process down) instead of Textual's
+    # default "press ctrl+q" hint.
+    BINDINGS = [Binding("ctrl+c", "quit", "Quit", show=False, priority=True)]
 
     def __init__(
         self,
@@ -269,18 +308,25 @@ class DJApp(App):
         config: Config | None = None,
         jobs=None,
         audio: bool = False,
+        backend: str = "sounddevice",
+        device=None,
+        engine=None,
     ) -> None:
         super().__init__()
         self._set_path = set_path
         self._pending_log: list[tuple[str, str]] = []
         self.paths = paths or Paths.default()
         self.config = config or Config.load(self.paths)
-        self.session = Session(self.paths, self.config, self._log, demo=demo, jobs=jobs, prepare=audio)
+        if engine is None and audio:
+            engine = self._start_engine(backend, device)
+            audio = engine is not None
+        self.session = Session(self.paths, self.config, self._log, demo=demo, jobs=jobs, prepare=audio, engine=engine)
         self.library: list[Track] = self.session.tracks
         self.transport = self.session.transport
         self.lanes: dict[str, Lane] = self.session.lanes
         self.scheduler = self.session.scheduler
-        self.interp = Interpreter(self.session, SETS_DIR, log=self._log, on_clear=self._clear_log)
+        self.interp = Interpreter(self.session, SETS_DIR, log=self._log, on_clear=self._clear_log,
+                                  on_quit=self.exit)
         self._last_tick = time.monotonic()
         self._tracks_version = -1
         self._snips_signature: tuple = ()
@@ -295,7 +341,7 @@ class DJApp(App):
                         yield DataTable(id="snips-table")
             with Vertical(id="right-pane"):
                 with Vertical(id="console-pane"):
-                    yield RichLog(id="console-log", markup=True, wrap=True)
+                    yield RichLog(id="console-log", markup=True, wrap=True, max_lines=4000)
                     yield Static(id="queue-view")
                     yield HistoryInput(
                         id="command-input",
@@ -349,6 +395,37 @@ class DJApp(App):
         self.set_interval(1 / 30, self._on_tick)
         self.query_one("#command-input", HistoryInput).focus()
         self._refresh_all()
+        # Startup objects (Textual, numpy, the library) live as long as the app:
+        # keep them out of the cyclic GC's full passes, which otherwise stall
+        # frames (and so delay reservations) by tens of milliseconds.
+        gc.collect()
+        gc.freeze()
+
+    def _start_engine(self, backend: str, device):
+        """Start the engine process; on failure log why and return None so the
+        app runs visual-only instead of not at all."""
+        from ..engine.host import HostConfig, RealtimeEngineClient
+
+        config = self.config
+        client = RealtimeEngineClient(HostConfig(
+            backend=backend, samplerate=config.samplerate, blocksize=config.blocksize, bpm=128.0,
+            device=device if device is not None else config.device, hostapi=config.hostapi,
+            limiter_ceiling_db=config.limiter_ceiling_db, master_gain=config.master_gain,
+            log_path=str(self.paths.log_dir / "engine.log"),
+        ))
+        try:
+            info = client.start()
+        except RuntimeError as exc:
+            self._pending_log.append((f"audio engine failed to start ({exc}); running visual-only", "error"))
+            return None
+        latency_ms = info.get("output_latency_s", 0.0) * 1000
+        self._pending_log.append((
+            f"audio: {info['device']} {info.get('hostapi', '')} -- {info['samplerate']} Hz, "
+            f"{info['blocksize']} samples, output latency {latency_ms:.0f} ms", "info"))
+        if info.get("fallback_reason"):
+            self._pending_log.append((
+                f"could not open the audio device ({info['fallback_reason']}); the engine runs without sound", "error"))
+        return client
 
     def on_unmount(self) -> None:
         self.session.close()
@@ -460,9 +537,22 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--set", dest="set_path", default=None, help="path to a .djs set file to load at startup")
     parser.add_argument("--demo", action="store_true", help="use the built-in demo library instead of your music")
     parser.add_argument("--no-audio", action="store_true", help="visual only: no rendering, no audio device")
+    parser.add_argument("--device", default=None, help="output device: index or part of its name (see --list-devices)")
+    parser.add_argument("--list-devices", action="store_true", help="list audio output devices and exit")
+    parser.add_argument("--null-audio", action="store_true",
+                        help="run the realtime engine without a device (timing and load, no sound)")
     args = parser.parse_args(argv)
+    if args.list_devices:
+        from ..engine.backends import list_output_devices
+
+        for dev in list_output_devices():
+            marker = "*" if dev.is_default else " "
+            print(f"{marker} {dev.index:>3}  {dev.hostapi:<22} {dev.channels}ch {dev.default_samplerate:>7.0f} Hz  {dev.name}")
+        print("(* = default output of its host API; pass the number or part of the name to --device)")
+        return
     set_path = Path(args.set_path) if args.set_path else None
-    DJApp(set_path=set_path, demo=args.demo, audio=not args.no_audio).run()
+    DJApp(set_path=set_path, demo=args.demo, audio=not args.no_audio,
+          backend="null" if args.null_audio else "sounddevice", device=args.device).run()
 
 
 if __name__ == "__main__":

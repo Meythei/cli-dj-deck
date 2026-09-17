@@ -62,7 +62,7 @@ HELP_TEXT = """commands:
   regrid(3, bpm=127.98, offset_ms=12)   fix a track's beat grid (saved as an override)
   setkey(3, "8A")                fix a track's key (saved as an override)
   load_set("demo")               run sets/demo.djs
-  clear() / help()               clear the log / show this text""".strip()
+  clear() / help() / quit()      clear the log / show this text / exit (Ctrl+C also quits)""".strip()
 
 
 class CommandError(Exception):
@@ -132,6 +132,7 @@ class Interpreter:
         *,
         log: Optional[LogFn] = None,
         on_clear: Callable[[], None] = lambda: None,
+        on_quit: Callable[[], None] = lambda: None,
     ) -> None:
         self.session = session
         self.transport: Transport = session.transport
@@ -141,6 +142,7 @@ class Interpreter:
         self.log = log or session.log
         self.sets_dir = sets_dir
         self.on_clear = on_clear
+        self.on_quit = on_quit
         self.quant_mode = "bar"
         self._in_scheduled_context = False
         self._snip_name_hint: Optional[str] = None
@@ -395,6 +397,7 @@ class Interpreter:
             "setkey": self._cmd_setkey,
             "load_set": self._cmd_load_set,
             "clear": self._cmd_clear,
+            "quit": self._cmd_quit,
             "help": self._cmd_help,
         }
 
@@ -541,6 +544,10 @@ class Interpreter:
             self.run(path.read_text(encoding="utf-8"))
         finally:
             self._set_depth -= 1
+
+    def _cmd_quit(self) -> None:
+        self.log("quitting", "info")
+        self.on_quit()
 
     def _cmd_clear(self) -> None:
         self.on_clear()

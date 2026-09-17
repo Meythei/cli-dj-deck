@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import dataclasses
 from concurrent.futures import Future
+import time
 from dataclasses import dataclass
 from typing import Callable, Optional, Union
 
@@ -109,6 +110,9 @@ class Session:
         self._registered: set[tuple] = set()
         self._frame_remainder = 0.0
         self._starting = False
+        self._running_commanded = False
+        self.engine_down_reported = False
+        self.lookahead_seconds = config.lookahead_ms / 1000.0 if self.engine.realtime else 0.0
 
         self.prep: Optional[PrepManager] = (
             PrepManager(self.jobs, paths.render_dir, paths.demo_audio_dir, self.samplerate, log) if prepare else None
@@ -334,13 +338,19 @@ class Session:
 
     # ---- engine: lane and transport commands ------------------------------------------------------
 
+    @property
+    def lookahead_beats(self) -> float:
+        return self.lookahead_seconds * self.transport.bpm / 60.0
+
     def immediate_beat(self) -> float:
         """The beat something "immediate" that needs a beat (an xf) starts on:
-        where the engine is now."""
+        where the engine is now, or -- for a realtime engine, whose position
+        we only see a block late -- a little ahead, so it isn't late on arrival."""
         if not self.engine.realtime:
             self.engine.flush()
             self._sync_view()
-        return self.transport.position_beats
+            return self.transport.position_beats
+        return self.transport.position_beats + 0.05 * self.transport.bpm / 60.0
 
     @staticmethod
     def lane_index(lane: Lane) -> int:
@@ -410,6 +420,7 @@ class Session:
         if self.transport.running:
             return
         self.transport.running = True
+        self._running_commanded = True
         # Reservations exactly at the start position (at(1, ...) typed before
         # start()) fire now, so their commands reach the engine before the start.
         self._starting = True
@@ -423,6 +434,7 @@ class Session:
     def stop(self) -> None:
         self.engine.send(cmd.TransportStop())
         self.transport.running = False
+        self._running_commanded = False
         self._after_immediate()
 
     # ---- tempo ---------------------------------------------------------------------------
@@ -473,9 +485,20 @@ class Session:
         transport = self.transport
         transport.position_beats = status.position_beats
         transport.bpm = status.bpm
-        if not self._starting:
-            transport.running = status.running
-        self.heard_beats = status.heard_beats
+        if self.engine.realtime:
+            # The status is a block old; what we asked for is the truth for
+            # deciding how to schedule the next command.
+            transport.running = self._running_commanded
+            heartbeat = getattr(self.engine, "extra", {}).get("heartbeat_ns", 0.0)
+            ahead = 0.0
+            if status.running and heartbeat:
+                ahead = min(0.05, max(0.0, (time.perf_counter_ns() - heartbeat) / 1e9))
+            self.heard_beats = status.heard_beats + ahead * status.bpm / 60.0
+        else:
+            if not self._starting:
+                transport.running = status.running
+            self._running_commanded = transport.running
+            self.heard_beats = status.heard_beats
         for lane, lane_status in zip(self.lanes.values(), status.lanes):
             lane.snippet = self.snippets.get(lane_status.uid) if lane_status.uid else None
             lane.started_at_beat = lane_status.start_beat
@@ -546,8 +569,16 @@ class Session:
 
     def tick(self, dt_seconds: float) -> None:
         """Called by the UI every frame with the wall-clock time since the
-        last call. A local (visual) engine is advanced by that much time."""
+        last call. A local (visual) engine is advanced by that much time; a
+        realtime engine runs by itself, and reservations due within the
+        lookahead window are evaluated now and sent with their beat."""
         self.poll()
+        if self.engine.realtime:
+            self._poll_engine_events()
+            self._sync_view()
+            if self.transport.running:
+                self.scheduler.poll(self.transport.position_beats + self.lookahead_beats)
+            return
         if self.transport.running and dt_seconds > 0:
             exact = dt_seconds * self.samplerate + self._frame_remainder
             frames = int(exact)
@@ -555,6 +586,14 @@ class Session:
             self.advance(frames)
         else:
             self._after_immediate()
+
+    def _poll_engine_events(self) -> None:
+        for kind, payload in self.engine.events():
+            level = "error" if kind in ("error", "failed") else "info"
+            self.log(f"engine: {payload}", level)
+        if not self.engine.alive and not self.engine_down_reported:
+            self.engine_down_reported = True
+            self.log("audio engine stopped responding -- no sound until restart (the set keeps its state)", "error")
 
     @property
     def activity(self) -> Optional[str]:
