@@ -27,7 +27,7 @@ from textual.containers import Horizontal, Vertical
 from textual.css.query import NoMatches
 from textual.widgets import DataTable, Input, RichLog, Static, TabbedContent, TabPane
 
-from ..config import Config, Paths
+from ..config import Config, Paths, install_dir
 from ..interpreter import Interpreter
 from ..lanes import LANE_NAMES, Lane, check_warnings
 from ..library import SAMPLES_PER_BEAT, Track
@@ -41,7 +41,7 @@ QUARTER_COLS_PER_BEAT = 4  # 1 character column ~= 1/4 beat in the zoomed lane v
 LANE_ACCENTS = {"L1": "cyan", "L2": "magenta", "L3": "yellow", "L4": "green"}
 MIN_WIDTH = 20
 LANE_GUTTER = 4  # columns left of the waveform area: lane name on info rows, blank on the rest
-SETS_DIR = Path(__file__).resolve().parents[2] / "sets"
+SETS_DIR = install_dir() / "sets"
 
 
 class HistoryInput(Input):

@@ -9,3 +9,8 @@ renders/
 /cache/
 /.clidj/
 *.npy
+
+# packaging (scripts/build_exe.py)
+/build/
+/dist/
+/release/

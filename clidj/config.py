@@ -7,6 +7,7 @@ redirects all of them under one folder, which is how tests stay hermetic.
 from __future__ import annotations
 
 import os
+import sys
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -41,6 +42,14 @@ loudness_target_lufs = -14.0
 limiter_ceiling_db = -1.0
 master_gain = 1.0
 """
+
+
+def install_dir() -> Path:
+    """Where the files shipped next to the program live (sets/): the folder of
+    cli-dj.exe in a packaged build, the repository root otherwise."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[1]
 
 
 @dataclass(frozen=True)
