@@ -23,8 +23,9 @@ docs/TASK_real-audio.md 7 are enforced here:
 from __future__ import annotations
 
 import dataclasses
-from concurrent.futures import Future
+import re
 import time
+from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import Callable, Optional, Union
 
@@ -43,6 +44,12 @@ from .transport import Transport
 from .workers import JobRunner, analyze_job
 
 LogFn = Callable[[str, str], None]
+LANE_MENTION = re.compile(r"\bL([1-9])\b")
+LATE_FLAG_SECONDS = 3.0
+# The worst UI-to-engine delay measured (UI tick 49 ms + one block + IPC,
+# docs/decisions.md D13), rounded up: a boundary closer than this to the
+# realtime engine's position is treated as already passed.
+COMMIT_MARGIN_SECONDS = 0.060
 
 
 class SessionError(Exception):
@@ -112,6 +119,9 @@ class Session:
         self._starting = False
         self._running_commanded = False
         self.engine_down_reported = False
+        self.late_lanes: dict[str, tuple[float, float]] = {}  # lane -> (monotonic time, ms late)
+        self._late_seen = 0
+        self.late_flash_until = 0.0
         self.lookahead_seconds = config.lookahead_ms / 1000.0 if self.engine.realtime else 0.0
 
         self.prep: Optional[PrepManager] = (
@@ -361,14 +371,25 @@ class Session:
             self.engine.flush()
             self._sync_view()
 
+    def _note_if_late(self, lane: Lane, beat: Optional[float]) -> None:
+        """A realtime engine is already past `beat`: the command will be
+        applied late (on the grid, but missing its first moments). Flag the lane."""
+        if beat is None or not self.engine.realtime or not self.transport.running:
+            return
+        behind = self.transport.position_beats - beat
+        if behind > 1e-6:
+            self.late_lanes[lane.name] = (time.monotonic(), behind * 60.0 / self.transport.bpm * 1000.0)
+
     def play(self, lane: Lane, snippet: Snippet, beat: Optional[float]) -> None:
         for bpm in self._bpms_in_play():
             self._ensure_registered(snippet, bpm)
+        self._note_if_late(lane, beat)
         self.engine.send(cmd.Play(self.lane_index(lane), snippet.uid, beat))
         if beat is None or not self.transport.running:
             self._after_immediate()
 
     def stop_lane(self, lane: Lane, beat: Optional[float]) -> None:
+        self._note_if_late(lane, beat)
         self.engine.send(cmd.Stop(self.lane_index(lane), beat))
         if beat is None or not self.transport.running:
             self._after_immediate()
@@ -489,6 +510,7 @@ class Session:
             # The status is a block old; what we asked for is the truth for
             # deciding how to schedule the next command.
             transport.running = self._running_commanded
+            transport.commit_margin_beats = COMMIT_MARGIN_SECONDS * status.bpm / 60.0
             heartbeat = getattr(self.engine, "extra", {}).get("heartbeat_ns", 0.0)
             ahead = 0.0
             if status.running and heartbeat:
@@ -508,6 +530,9 @@ class Session:
         for automation_id, xf in list(self.crossfades.items()):
             if xf.end_beat <= status.position_beats:
                 del self.crossfades[automation_id]
+        if status.stats.late_commands > self._late_seen:
+            self._late_seen = status.stats.late_commands
+            self.late_flash_until = time.monotonic() + LATE_FLAG_SECONDS
 
     def advance(self, frames: int):
         """Local engines only: fire every reservation due within the next
@@ -595,6 +620,74 @@ class Session:
             self.engine_down_reported = True
             self.log("audio engine stopped responding -- no sound until restart (the set keeps its state)", "error")
 
+    # ---- what the UI shows ------------------------------------------------------------------
+
+    def audio_summary(self) -> dict:
+        """Numbers for the status row: device, format, latency, load, problems."""
+        engine = self.engine
+        status = self.last_status or engine.status()
+        if not engine.realtime:
+            return {"mode": "off"}
+        info = getattr(engine, "info", {}) or {}
+        extra = getattr(engine, "extra", {}) or {}
+        samplerate = status.samplerate or self.samplerate
+        return {
+            "mode": info.get("backend", "?"),
+            "device": info.get("device", ""),
+            "hostapi": info.get("hostapi", ""),
+            "samplerate": samplerate,
+            "blocksize": int(extra.get("blocksize", 0) or info.get("blocksize", 0)),
+            "latency_ms": status.latency_samples / samplerate * 1000.0 if samplerate else 0.0,
+            "load": extra.get("callback_load_avg", 0.0),
+            "load_max": extra.get("callback_load_max", 0.0),
+            "underruns": int(extra.get("underruns", 0)),
+            "late": status.stats.late_commands,
+            "late_max_ms": status.stats.late_max_ms,
+            "late_recent": time.monotonic() < self.late_flash_until,
+            "errors": status.stats.errors,
+            "missing": status.stats.missing_buffers,
+            "alive": engine.alive,
+        }
+
+    def tempo_note(self) -> Optional[str]:
+        if self.pending_bpm is not None and self.prep is not None:
+            ready, failed, total = self._batch_progress(self.pending_bpm, list(self.snippets.values()))
+            return f"-> {self.pending_bpm:g} BPM after rendering ({ready + failed}/{total})"
+        for _, beat, description in self.scheduler.pending():
+            if description.startswith("bpm("):
+                return f"-> {description} @ bar {self.transport.bar_at(beat)}"
+        return None
+
+    def lane_notes(self, lane_name: str) -> list[tuple[str, str]]:
+        """Short (text, style) notes for a lane's row: a play waiting for its
+        render, a late command, the next thing queued for it, a crossfade."""
+        notes: list[tuple[str, str]] = []
+        late = self.late_lanes.get(lane_name)
+        if late is not None:
+            if time.monotonic() - late[0] < LATE_FLAG_SECONDS:
+                notes.append((f"LATE +{late[1]:.0f}ms", "bold red"))
+            else:
+                del self.late_lanes[lane_name]
+        for hold in self.holds:
+            if _mentions(hold.description, lane_name):
+                notes.append((f"waiting for render: {hold.snippet.name}", "bold yellow"))
+                break
+        for xf in self.crossfades.values():
+            if lane_name in (xf.from_lane, xf.to_lane):
+                position = self.transport.position_beats
+                if position < xf.start_beat:
+                    notes.append((f"xf {xf.from_lane}->{xf.to_lane} @{self.transport.display_at(xf.start_beat)}", "cyan"))
+                else:
+                    span = max(1e-9, xf.end_beat - xf.start_beat)
+                    notes.append((f"xf {xf.from_lane}->{xf.to_lane} {min(1.0, (position - xf.start_beat) / span):.0%}",
+                                  "cyan"))
+                break
+        for _, beat, description in self.scheduler.pending():
+            if _mentions(description, lane_name):
+                notes.append((f"next @{self.transport.display_at(beat)}: {description}", "grey62"))
+                break
+        return notes
+
     @property
     def activity(self) -> Optional[str]:
         """One-line description of background work, for the UI."""
@@ -617,3 +710,7 @@ class Session:
     def close(self) -> None:
         self.engine.close()
         self.jobs.shutdown()
+
+
+def _mentions(text: str, lane_name: str) -> bool:
+    return any(f"L{match}" == lane_name for match in LANE_MENTION.findall(text))

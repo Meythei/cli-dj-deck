@@ -79,8 +79,9 @@ class Scheduler:
         warning. A target exactly *at* a stopped transport's position is not
         in the past -- it fires the moment the transport starts."""
         position = self.transport.position_beats
+        margin = self.transport.commit_margin_beats if self.transport.running else 0.0
         passed = target_beats < position - EPSILON or (
-            self.transport.running and target_beats <= position + EPSILON
+            self.transport.running and target_beats <= position + margin + EPSILON
         )
         if passed:
             fallback = self.transport.next_boundary_beats("bar")

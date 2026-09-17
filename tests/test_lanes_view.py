@@ -37,6 +37,8 @@ def ruler_and_wave_columns(text, width):
     bar_lines = {i for i, ch in enumerate(ruler) if ch == "|"}
     spikes = set()
     for line in lines[2:]:
+        if line[:4].strip():  # lane info rows (gain/eq meters) start with the lane name
+            continue
         spikes |= {i for i, ch in enumerate(line) if ch == "█"}
     return playhead, bar_lines, spikes
 

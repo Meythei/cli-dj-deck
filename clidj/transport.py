@@ -26,6 +26,10 @@ class Transport:
     beats_per_bar: int = 4
     position_beats: float = 0.0
     running: bool = False
+    # How far past the position a boundary must be to still be reachable.
+    # With a realtime engine a command needs a few ms to get there, so a bar
+    # head closer than this counts as already gone (see Session).
+    commit_margin_beats: float = 0.0
 
     def start(self) -> None:
         self.running = True
@@ -69,7 +73,8 @@ class Transport:
         return (bar - 1) * self.beats_per_bar
 
     def next_boundary_beats(self, quant: str) -> float:
-        """The next beat matching `quant`, strictly after the current position.
+        """The next beat matching `quant`, strictly after the current position
+        plus the commit margin.
 
         quant: "beat" | "bar" | "phrase" | "none" (returns position_beats as-is).
         """
@@ -81,5 +86,5 @@ class Transport:
             unit = self.beats_per_bar * (QUANT_UNITS_BARS[quant] or 1)
         else:
             raise ValueError(f"unknown quantize mode {quant!r}")
-        n = math.floor((self.position_beats + EPSILON) / unit) + 1
+        n = math.floor((self.position_beats + self.commit_margin_beats + EPSILON) / unit) + 1
         return n * unit

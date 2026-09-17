@@ -103,6 +103,14 @@ def _loop_display(lane: Lane, transport: Transport) -> str:
 
 
 @dataclass(frozen=True)
+class _Clock:
+    """The bits of a Transport the lane drawing reads, at a given position."""
+
+    position_beats: float
+    beats_per_bar: int
+
+
+@dataclass(frozen=True)
 class WaveAxis:
     """The one column <-> beat mapping shared by the ruler and every lane's
     waveform rows, so the ▼ marker, bar lines and waveform columns can't
@@ -192,11 +200,12 @@ class LanesView(Static):
     a two-row zoomed, center-locked waveform -- all drawn on one WaveAxis so
     beat heads line up vertically across the ruler and every lane."""
 
-    def __init__(self, transport: Transport, lanes: dict[str, Lane], quant_getter, **kwargs) -> None:
+    def __init__(self, transport: Transport, lanes: dict[str, Lane], quant_getter, session=None, **kwargs) -> None:
         super().__init__(**kwargs)
         self.transport = transport
         self.lanes = lanes
         self._quant_getter = quant_getter
+        self.session = session
         self._waveforms: dict[int, tuple[list, np.ndarray]] = {}
 
     def _waveform_array(self, track: Track) -> np.ndarray:
@@ -212,18 +221,60 @@ class LanesView(Static):
 
     def build_text(self, width: int) -> Text:
         transport = self.transport
+        # Draw what is being *heard*: the engine is ahead of the speakers by
+        # its output latency plus the limiter's lookahead.
+        position = self.session.heard_beats if self.session is not None else transport.position_beats
+        clock = _Clock(position, transport.beats_per_bar)
         axis = WaveAxis.for_width(width)
-        heads = _bar_head_columns(axis, transport.position_beats, transport.beats_per_bar)
+        heads = _bar_head_columns(axis, position, transport.beats_per_bar)
 
         status = "● RUN" if transport.running else "■ STOP"
-        header = (
-            f"TRANSPORT  {transport.display}  {status}  {transport.bpm:.1f} BPM  "
-            f"{transport.beats_per_bar}/4  q:{self._quant_getter()}"
+        header = Text(
+            f"TRANSPORT  {transport.display_at(position)}  {status}  {transport.bpm:.1f} BPM  "
+            f"{transport.beats_per_bar}/4  q:{self._quant_getter()}",
+            style="bold",
         )
-        rows: list[Text] = [Text(header, style="bold"), self._ruler(axis, heads)]
+        rows: list[Text] = [header]
+        if self.session is not None:
+            note = self.session.tempo_note()
+            if note:
+                header.append(f"  {note}", style="bold yellow")
+            rows.append(self._audio_row(width))
+        rows.append(self._ruler(axis, heads))
         for name in LANE_NAMES:
-            rows.extend(self._lane_rows(self.lanes[name], axis, heads, width))
+            rows.extend(self._lane_rows(self.lanes[name], axis, heads, width, clock))
         return Text("\n").join(rows)
+
+    def _audio_row(self, width: int) -> Text:
+        summary = self.session.audio_summary()
+        row = Text("AUDIO      ", style="bold")
+        if summary["mode"] == "off":
+            row.append("off (--no-audio: visual only)", style="grey62")
+            return row
+        if not summary["alive"]:
+            row.append("ENGINE DOWN -- no sound; restart cli-dj", style="bold white on red")
+            return row
+        # Problems first, so a narrow pane never truncates them away.
+        row.append(f"xrun {summary['underruns']}", style="bold red" if summary["underruns"] else "grey70")
+        late_style = "bold white on red" if summary["late_recent"] else ("bold red" if summary["late"] else "grey70")
+        late_text = f"  late {summary['late']}"
+        if summary["late"]:
+            late_text += f" (max {summary['late_max_ms']:.0f}ms)"
+        row.append(late_text, style=late_style)
+        if summary["errors"] or summary["missing"]:
+            row.append(f"  err {summary['errors']} missing {summary['missing']}", style="bold red")
+        # Warn on the smoothed load (about the last second) reaching half the
+        # block time; a one-off peak only matters if it overran a whole block.
+        load, load_max = summary["load"], summary["load_max"]
+        row.append(f"  cpu {load:.0%}", style="bold yellow" if load >= 0.5 else "grey70")
+        row.append(f" (max {load_max:.0%})", style="bold yellow" if load_max >= 1.0 else "grey70")
+        row.append(f"  lat {summary['latency_ms']:.0f}ms  {summary['samplerate'] / 1000:g}k/{summary['blocksize']}",
+                   style="grey70")
+        device = summary["device"] if summary["mode"] != "null" else "null backend (no sound)"
+        hostapi = summary["hostapi"].replace("Windows ", "")
+        row.append(f"  {device}" + (f" [{hostapi}]" if hostapi else ""), style="grey50")
+        row.truncate(width)
+        return row
 
     def _ruler(self, axis: WaveAxis, heads: dict[int, str]) -> Text:
         row = [" "] * (axis.left + axis.width)
@@ -232,7 +283,8 @@ class LanesView(Static):
         row[axis.center] = "▼"
         return Text("".join(row), style="grey62")
 
-    def _lane_rows(self, lane: Lane, axis: WaveAxis, heads: dict[int, str], width: int) -> list[Text]:
+    def _lane_rows(self, lane: Lane, axis: WaveAxis, heads: dict[int, str], width: int, clock=None) -> list[Text]:
+        clock = clock or self.transport
         accent = LANE_ACCENTS.get(lane.name, "white")
         warnings: list[str] = []
         if lane.snippet is not None:
@@ -248,21 +300,30 @@ class LanesView(Static):
         info.append(f"{lane.name:<{LANE_GUTTER}}", style="bold yellow" if warnings else f"bold {accent}")
         info.append(f"{label:<12.12} {role:<6.6} {key:<4.4}", style="grey70")
         info.append(f" gain {_meter(lane.gain)} ", style="grey62")
-        info.append(f"{_loop_display(lane, self.transport):<11.11}", style="grey62")
+        eq_flat = lane.lo == lane.mid == lane.hi == 1.0
+        info.append("eq" + "".join(_meter(v, 1) for v in (lane.lo, lane.mid, lane.hi)) + " ",
+                    style="grey62" if eq_flat else "bold cyan")
+        if lane.muted:
+            info.append("MUTE ", style="bold red")
+        info.append(f"{_loop_display(lane, clock):<11.11}", style="grey62")
+        if self.session is not None:
+            for note, style in self.session.lane_notes(lane.name):
+                info.append(f" {note}", style=style)
         if warnings:
             info.append(" " + warnings[0], style="yellow")
         info.truncate(width)
 
-        top, bottom = self._wave_rows(lane, axis, heads, accent)
+        top, bottom = self._wave_rows(lane, axis, heads, accent, clock)
         return [info, top, bottom]
 
-    def _wave_rows(self, lane: Lane, axis: WaveAxis, heads: dict[int, str], accent: str) -> tuple[Text, Text]:
+    def _wave_rows(self, lane: Lane, axis: WaveAxis, heads: dict[int, str], accent: str,
+                   clock=None) -> tuple[Text, Text]:
         """Two rows stacked into one bar per column: the bottom row fills up
         to half amplitude, the top row shows the rest."""
         top = Text(" " * axis.left)
         bottom = Text(" " * axis.left)
         snippet = lane.snippet
-        local_now = None if snippet is None else lane.local_beat(self.transport)
+        local_now = None if snippet is None else lane.local_beat(clock or self.transport)
         columns = axis.columns()
         tints = [" on grey15" if heads.get(col) == "bar" else "" for col in columns]
 
@@ -348,7 +409,8 @@ class DJApp(App):
                         placeholder='start()  L1 << kick  at(33, xf(L1, L2, 8))  help()',
                     )
                 yield LanesView(
-                    self.transport, self.lanes, lambda: self.interp.quant_mode, id="lanes-view"
+                    self.transport, self.lanes, lambda: self.interp.quant_mode, session=self.session,
+                    id="lanes-view",
                 )
 
     def on_mount(self) -> None:
